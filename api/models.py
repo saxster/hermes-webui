@@ -63,10 +63,24 @@ class Session:
 
     def save(self) -> None:
         self.updated_at = time.time()
-        self.path.write_text(
-            json.dumps(self.__dict__, ensure_ascii=False, indent=2),
-            encoding='utf-8',
-        )
+        import tempfile, os
+        data = json.dumps(self.__dict__, ensure_ascii=False, indent=2)
+        fd, tmp_path = tempfile.mkstemp(dir=str(SESSION_DIR), suffix='.tmp')
+        closed = False
+        try:
+            os.write(fd, data.encode('utf-8'))
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            os.replace(tmp_path, str(self.path))
+        except BaseException:
+            if not closed:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         _write_session_index()
 
     @classmethod

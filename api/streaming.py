@@ -81,12 +81,17 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         except Exception:
             pass
 
+    _agent_lock_held = False
     try:
         s = get_session(session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
         s.model = model
 
         _agent_lock = _get_session_agent_lock(session_id)
+        # Acquire per-session lock to prevent concurrent runs of the SAME session.
+        # This blocks rapid duplicate messages from corrupting session state.
+        _agent_lock.acquire()
+        _agent_lock_held = True
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
         if cancel_event.is_set():
@@ -363,6 +368,8 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         else:
             put('apperror', {'message': err_str, 'type': 'error'})
     finally:
+        if _agent_lock_held:
+            _agent_lock.release()
         _clear_thread_env()  # TD1: always clear thread-local context
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
