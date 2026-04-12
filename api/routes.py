@@ -964,13 +964,15 @@ def _handle_chat_sync(handler, body):
     if not msg: return j(handler, {'error': 'empty message'}, status=400)
     workspace = Path(body.get('workspace') or s.workspace).expanduser().resolve()
     s.workspace = str(workspace); s.model = body.get('model') or s.model
-    old_cwd = os.environ.get('TERMINAL_CWD')
-    os.environ['TERMINAL_CWD'] = str(workspace)
-    old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
-    old_session_key = os.environ.get('HERMES_SESSION_KEY')
-    os.environ['HERMES_EXEC_ASK'] = '1'
-    os.environ['HERMES_SESSION_KEY'] = s.session_id
+    from api.streaming import _ENV_LOCK
+    _ENV_LOCK.acquire()
     try:
+        old_cwd = os.environ.get('TERMINAL_CWD')
+        os.environ['TERMINAL_CWD'] = str(workspace)
+        old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
+        old_session_key = os.environ.get('HERMES_SESSION_KEY')
+        os.environ['HERMES_EXEC_ASK'] = '1'
+        os.environ['HERMES_SESSION_KEY'] = s.session_id
         from run_agent import AIAgent
         with CHAT_LOCK:
             from api.config import resolve_model_provider
@@ -1012,12 +1014,15 @@ def _handle_chat_sync(handler, body):
                 persist_user_message=msg,
             )
     finally:
-        if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
-        else: os.environ['TERMINAL_CWD'] = old_cwd
-        if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
-        else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
-        if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
-        else: os.environ['HERMES_SESSION_KEY'] = old_session_key
+        try:
+            if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
+            else: os.environ['TERMINAL_CWD'] = old_cwd
+            if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
+            else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
+            if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
+            else: os.environ['HERMES_SESSION_KEY'] = old_session_key
+        finally:
+            _ENV_LOCK.release()
     s.messages = result.get('messages') or s.messages
     s.title = title_from(s.messages, s.title); s.save()
     # Sync to state.db for /insights (opt-in setting)
