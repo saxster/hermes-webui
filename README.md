@@ -191,6 +191,23 @@ Full list of environment variables:
 | `HERMES_HOME` | `~/.hermes` | Base directory for Hermes state (affects all paths) |
 | `HERMES_CONFIG_PATH` | `~/.hermes/config.yaml` | Path to Hermes config file |
 
+### Tool parity with the CLI
+
+WebUI uses a hardcoded default toolset list that is **narrower** than the CLI's
+`hermes-cli` superset. If you want WebUI to expose the same tools as the CLI
+(including any MCP servers configured under `mcp_servers:`), add this to
+`~/.hermes/config.yaml`:
+
+```yaml
+platform_toolsets:
+  cli:
+  - hermes-cli
+```
+
+Without this entry, WebUI uses an internal default of ~14 toolsets and MCP
+tools may not be visible to the LLM, even though the MCP servers themselves
+are connected. The top-level `toolsets:` key only affects CLI mode, not WebUI.
+
 ---
 
 ## Accessing from a remote machine
