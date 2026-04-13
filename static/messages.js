@@ -110,7 +110,7 @@ async function send(){
     _renderPending=true;
     requestAnimationFrame(()=>{
       _renderPending=false;
-      if(assistantBody) assistantBody.innerHTML=renderMd(assistantText);
+      updateLiveAssistantBody(assistantBody, assistantText);
       scrollIfPinned();
     });
   }
@@ -360,4 +360,3 @@ function stopApprovalPolling() {
   if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
 }
 // ── Panel navigation (Chat / Tasks / Skills / Memory) ──
-

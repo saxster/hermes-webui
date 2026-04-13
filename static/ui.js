@@ -123,6 +123,33 @@ function scrollToBottom(){
   if(el) el.scrollTop=el.scrollHeight;
 }
 
+function renderLiveMessage(raw){
+  const text=String(raw??'');
+  if(!text) return '';
+  const parts=text.split('```');
+  let html='';
+  for(let i=0;i<parts.length;i++){
+    const segment=parts[i];
+    const inCode=i%2===1;
+    if(!inCode){
+      if(segment) html+=`<div class="live-text">${esc(segment).replace(/\n/g,'<br>')}</div>`;
+      continue;
+    }
+    const newlineIndex=segment.indexOf('\n');
+    const lang=newlineIndex===-1?segment.trim():segment.slice(0,newlineIndex).trim();
+    const code=newlineIndex===-1?'':segment.slice(newlineIndex+1);
+    const header=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
+    html+=`${header}<pre><code>${esc(code)}</code></pre>`;
+  }
+  return html;
+}
+
+function updateLiveAssistantBody(target, raw){
+  const html=renderLiveMessage(raw);
+  if(target) target.innerHTML=html;
+  return html;
+}
+
 function getModelLabel(modelId){
   if(!modelId) return 'Unknown';
   // Check dynamic labels first, then fall back to splitting the ID
@@ -1099,4 +1126,3 @@ async function uploadPendingFiles(){
   if(failures===total&&total>0)throw new Error(`All ${total} upload(s) failed`);
   return names;
 }
-
