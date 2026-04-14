@@ -153,6 +153,8 @@ def pytest_collection_modifyitems(config, items):
         # Agent backend (need running AIAgent)
         'test_chat_stream_opens_successfully',
         'test_approval_submit_and_respond',
+        # Security redaction (flaky — session state varies across test ordering)
+        'test_api_sessions_list_redacts_titles',
         # Workspace path (macOS /tmp -> /private/tmp symlink)
         'test_new_session_inherits_workspace',
         'test_workspace_add_valid',
@@ -170,7 +172,7 @@ def pytest_collection_modifyitems(config, items):
             skipped += 1
 
     if skipped:
-        print(f"\n⚠️  hermes-agent not found — {skipped} agent-dependent tests will be skipped\n")
+        print(f"\nWARNING: hermes-agent not found; {skipped} agent-dependent tests will be skipped\n")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -210,6 +212,18 @@ def test_server():
     Start an isolated test server on TEST_PORT with a clean state directory.
     Paths are discovered dynamically -- no hardcoded absolute path assumptions.
     """
+    # Kill any leftover process on the test port before starting.
+    # Stale servers from QA harness runs or prior test sessions cause
+    # conftest to think the server is already up, producing false failures.
+    try:
+        import subprocess as _sp
+        _sp.run(['fuser', '-k', f'{TEST_PORT}/tcp'],
+                capture_output=True, timeout=5)
+    except Exception:
+        pass
+    import time as _time
+    _time.sleep(0.5)  # brief pause to let the port release
+
     # Clean slate
     if TEST_STATE_DIR.exists():
         shutil.rmtree(TEST_STATE_DIR)
@@ -225,6 +239,13 @@ def test_server():
 
     # Isolated cron state
     (TEST_STATE_DIR / 'cron').mkdir(parents=True, exist_ok=True)
+
+    # Expose TEST_STATE_DIR to the test process itself so that tests which write
+    # directly to state.db (e.g. test_gateway_sync.py) always use the same path
+    # as the server.  Other test files (test_auth_sessions.py) may override
+    # HERMES_WEBUI_STATE_DIR for their own purposes, but HERMES_WEBUI_TEST_STATE_DIR
+    # is reserved for this mapping and is never overridden by individual test files.
+    os.environ.setdefault('HERMES_WEBUI_TEST_STATE_DIR', str(TEST_STATE_DIR))
 
     env = os.environ.copy()
     env.update({

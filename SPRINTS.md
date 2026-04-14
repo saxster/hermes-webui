@@ -1,22 +1,28 @@
 # Hermes Web UI -- Forward Sprint Plan
 
-> Current state: v0.36 | 433 tests | Daily driver ready
-> This document plans the path from here to two targets:
+> Current state: v0.50.21 | 961 tests | Full daily driver — CLI parity achieved
 >
-> Target A: 1:1 feature parity with the Hermes CLI (everything you can do from the
->           terminal, you can do from the browser)
+> NOTE: Most planned work in this document has now shipped. This file is preserved
+> as a historical planning record. Current sprint state and version history live
+> in CHANGELOG.md and ROADMAP.md.
 >
-> Target B: 1:1 parity with Claude's reproducible features (the full Claude
->           browser UI experience, minus things only Anthropic can build)
+> Target A (CLI parity): ✅ Complete — all core tools, workspace, cron, skills,
+>           memory, sessions, profiles, model routing, streaming, voice, mobile.
 >
-> Sprints are ordered by impact. Each builds on the one before.
-> Past sprint history lives in CHANGELOG.md.
+> Target B (Claude parity): ~90% — thinking display, math rendering (KaTeX),
+>           tool cards, workspace preview, onboarding, settings panel all done.
+>           Remaining: full subagent transparency UI, file diff viewer.
+>
+> Last meaningful update: v0.50.21 (April 13, 2026). See CHANGELOG.md for full history.
 
 ---
 
-## Where we are now (v0.36)
+## Where we are now (v0.50.21 — updated April 2026)
 
-**CLI parity: ~95% complete.** Core agent loop, all tools visible, workspace
+> The sections below describe the state as of v0.36 for historical reference.
+> See ROADMAP.md for the current sprint history table (v0.36 → v0.50.21).
+
+**CLI parity: ✅ Complete** as of v0.50.x. Core agent loop, all tools visible, workspace
 file ops with tree view and git detection, cron/skills/memory CRUD, session
 management, streaming with rAF throttle, cancel, multi-provider models, custom
 endpoint discovery, slash commands (help/clear/model/workspace/new/usage/theme/compact),
@@ -256,7 +262,7 @@ inconsistently across platforms. These were the most common visual complaints.
   button now only appears in the hover overlay like all other actions.
 
 ### Track B: Features
-- **SVG action icons.** Replaced all emoji HTML entities (★, 📂, 📦, ⊕, 🗑)
+- **SVG action icons.** Replaced old symbol and emoji HTML entities
   with monochrome SVG line icons that inherit `currentColor`. Consistent
   rendering across macOS, Linux, and Windows. Icons: pin (star), folder,
   archive (box), duplicate (overlapping squares), trash (bin with lines).
@@ -762,7 +768,7 @@ Both architectures in one .app. No separate downloads needed.
 - JS bridge fires when approval card appears/disappears
 
 **Menu bar mode (optional, v2):**
-- A small status bar item (⚗️ icon in menu bar) that opens a compact popover
+- A small status bar item (beaker icon in menu bar) that opens a compact popover
 - Popover shows current session status, last message, quick-compose field
 - Useful for running Hermes in the background without a full window
 
@@ -1163,8 +1169,8 @@ New test cases in `tests/test_sprint26.py`:
 
 ---
 
-*Last updated: April 5, 2026*
-*Current version: v0.36.2 | 440 tests*
+*Last updated: April 12, 2026*
+*Current version: v0.49.1 | 700 tests*
 *Next sprint: Sprint 24 (Web Polish + Bug Fix Pass)*
 *Horizon sprint: Sprint 25 (macOS Desktop Application)*
 *Docs sweep policy: update markdown proactively during PR reviews and after significant releases*

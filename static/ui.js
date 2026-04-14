@@ -1,7 +1,28 @@
 const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default'};
 const INFLIGHT={};  // keyed by session_id while request in-flight
-const MSG_QUEUE=[];  // messages queued while a request is in-flight
+const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
 const $=id=>document.getElementById(id);
+function _getSessionQueue(sid, create=false){
+  if(!sid) return [];
+  if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
+  return SESSION_QUEUES[sid]||[];
+}
+function queueSessionMessage(sid, payload){
+  if(!sid||!payload) return 0;
+  const q=_getSessionQueue(sid,true);
+  q.push(payload);
+  return q.length;
+}
+function shiftQueuedSessionMessage(sid){
+  const q=_getSessionQueue(sid,false);
+  if(!q.length) return null;
+  const next=q.shift();
+  if(!q.length) delete SESSION_QUEUES[sid];
+  return next;
+}
+function getQueuedSessionCount(sid){
+  return _getSessionQueue(sid,false).length;
+}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
@@ -34,6 +55,7 @@ function _applyModelToDropdown(modelId, sel){
   const resolved=_findModelInDropdown(modelId,sel);
   if(resolved){
     sel.value=resolved;
+    if(sel.id==='modelSelect' && typeof syncModelChip==='function') syncModelChip();
     return resolved;
   }
   return null;
@@ -45,6 +67,8 @@ async function populateModelDropdown(){
   try{
     const data=await fetch(new URL('/api/models',location.origin).href,{credentials:'include'}).then(r=>r.json());
     if(!data.groups||!data.groups.length) return; // keep HTML defaults
+    // Store active provider globally so the send path can warn on mismatch
+    window._activeProvider=data.active_provider||null;
     // Clear existing options
     sel.innerHTML='';
     _dynamicModelLabels={};
@@ -64,11 +88,196 @@ async function populateModelDropdown(){
     if(data.default_model && !localStorage.getItem('hermes-webui-model')){
       _applyModelToDropdown(data.default_model, sel);
     }
+    if(typeof syncModelChip==='function') syncModelChip();
+    // Kick off a background live-model fetch for the active provider.
+    // This runs after the static list is already shown (no blocking flicker).
+    if(data.active_provider) _fetchLiveModels(data.active_provider, sel);
   }catch(e){
     // API unavailable -- keep the hardcoded HTML options as fallback
     console.warn('Failed to load models from server:',e.message);
+    if(typeof syncModelChip==='function') syncModelChip();
   }
 }
+
+// Cache so we don't re-fetch on every page load
+const _liveModelCache={};
+
+async function _fetchLiveModels(provider, sel){
+  if(!provider||!sel) return;
+  // Don't fetch for providers where we know it's unsupported or unnecessary
+  // All providers now supported via agent's provider_model_ids() — no exclusions needed
+  if(_liveModelCache[provider]) return; // already fetched this session
+  try{
+    const url=new URL('/api/models/live',location.origin);
+    url.searchParams.set('provider',provider);
+    const data=await fetch(url.href,{credentials:'include'}).then(r=>r.json());
+    if(!data.models||!data.models.length) return;
+    _liveModelCache[provider]=data.models;
+    // Remember current selection before rebuilding options
+    const currentVal=sel.value;
+    // Rebuild the optgroup for this provider with live models
+    // Keep other providers' optgroups intact
+    let providerGroup=null;
+    for(const og of sel.querySelectorAll('optgroup')){
+      if(og.label&&og.label.toLowerCase().includes(provider.toLowerCase())){
+        providerGroup=og; break;
+      }
+    }
+    if(!providerGroup){
+      // No existing group — add a new one
+      providerGroup=document.createElement('optgroup');
+      providerGroup.label=provider.charAt(0).toUpperCase()+provider.slice(1)+' (live)';
+      sel.appendChild(providerGroup);
+    }
+    // Rebuild options from live data
+    const existingIds=new Set([...sel.options].map(o=>o.value));
+    let added=0;
+    for(const m of data.models){
+      if(existingIds.has(m.id)) continue; // already shown from static list
+      const opt=document.createElement('option');
+      opt.value=m.id;
+      opt.textContent=m.label||m.id;
+      opt.title='Live model — fetched from provider';
+      providerGroup.appendChild(opt);
+      _dynamicModelLabels[m.id]=m.label||m.id;
+      added++;
+    }
+    if(added>0){
+      // Restore selection
+      if(currentVal) _applyModelToDropdown(currentVal, sel);
+      if(typeof syncModelChip==='function') syncModelChip();
+      console.log('[hermes] Live models loaded for',provider+':',added,'new models added');
+    }
+  }catch(e){
+    console.debug('[hermes] Live model fetch failed for',provider,e.message);
+  }
+}
+
+/**
+ * Check if the given model ID belongs to a different provider than the one
+ * currently configured in Hermes. Returns a warning string if mismatched,
+ * or null if the selection looks compatible.
+ *
+ * Provider detection is intentionally loose — we compare the model's slash
+ * prefix (e.g. "openai/" from "openai/gpt-4o") against the active provider
+ * name. Custom/local endpoints report active_provider='custom' or the
+ * base_url hostname and we skip the check to avoid false positives.
+ */
+function _checkProviderMismatch(modelId){
+  const ap=(window._activeProvider||'').toLowerCase();
+  if(!ap||ap==='custom'||ap==='openrouter') return null; // can't reliably check
+  const slash=modelId.indexOf('/');
+  if(slash<0) return null; // bare model name, no provider prefix
+  const modelProvider=modelId.substring(0,slash).toLowerCase();
+  // Normalise common aliases
+  const aliases={'claude':'anthropic','gpt':'openai','gemini':'google'};
+  const norm=p=>aliases[p]||p;
+  if(norm(modelProvider)!==norm(ap)){
+    return (window.t?window.t('provider_mismatch_warning',modelId,ap):
+      `"${modelId}" may not work with your configured provider (${ap}). Send anyway or run \`hermes model\` to switch.`);
+  }
+  return null;
+}
+
+function _selectedModelOption(){
+  const sel=$('modelSelect');
+  if(!sel) return null;
+  return sel.options[sel.selectedIndex]||null;
+}
+
+function syncModelChip(){
+  const sel=$('modelSelect');
+  const chip=$('composerModelChip');
+  const label=$('composerModelLabel');
+  const dd=$('composerModelDropdown');
+  if(!sel||!chip||!label) return;
+  const opt=_selectedModelOption();
+  label.textContent=opt?opt.textContent:getModelLabel(sel.value||'');
+  chip.title=sel.value||'Conversation model';
+  chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+}
+
+function _positionModelDropdown(){
+  const dd=$('composerModelDropdown');
+  const chip=$('composerModelChip');
+  const footer=document.querySelector('.composer-footer');
+  if(!dd||!chip||!footer) return;
+  const chipRect=chip.getBoundingClientRect();
+  const footerRect=footer.getBoundingClientRect();
+  let left=chipRect.left-footerRect.left;
+  const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
+  left=Math.max(0, Math.min(left, maxLeft));
+  dd.style.left=`${left}px`;
+}
+
+function renderModelDropdown(){
+  const dd=$('composerModelDropdown');
+  const sel=$('modelSelect');
+  if(!dd||!sel) return;
+  dd.innerHTML='';
+  for(const child of Array.from(sel.children)){
+    if(child.tagName==='OPTGROUP'){
+      const heading=document.createElement('div');
+      heading.className='model-group';
+      heading.textContent=child.label||'Models';
+      dd.appendChild(heading);
+      for(const opt of Array.from(child.children)){
+        const row=document.createElement('div');
+        row.className='model-opt'+(opt.value===sel.value?' active':'');
+        row.innerHTML=`<span class="model-opt-name">${esc(opt.textContent||getModelLabel(opt.value))}</span><span class="model-opt-id">${esc(opt.value)}</span>`;
+        row.onclick=()=>selectModelFromDropdown(opt.value);
+        dd.appendChild(row);
+      }
+      continue;
+    }
+    if(child.tagName==='OPTION'){
+      const row=document.createElement('div');
+      row.className='model-opt'+(child.value===sel.value?' active':'');
+      row.innerHTML=`<span class="model-opt-name">${esc(child.textContent||getModelLabel(child.value))}</span><span class="model-opt-id">${esc(child.value)}</span>`;
+      row.onclick=()=>selectModelFromDropdown(child.value);
+      dd.appendChild(row);
+    }
+  }
+}
+
+async function selectModelFromDropdown(value){
+  const sel=$('modelSelect');
+  if(!sel||sel.value===value) { closeModelDropdown(); return; }
+  sel.value=value;
+  syncModelChip();
+  closeModelDropdown();
+  if(typeof sel.onchange==='function') await sel.onchange();
+}
+
+function toggleModelDropdown(){
+  const dd=$('composerModelDropdown');
+  const chip=$('composerModelChip');
+  const sel=$('modelSelect');
+  if(!dd||!chip||!sel) return;
+  const open=dd.classList.contains('open');
+  if(open){closeModelDropdown(); return;}
+  if(typeof closeProfileDropdown==='function') closeProfileDropdown();
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+  renderModelDropdown();
+  dd.classList.add('open');
+  _positionModelDropdown();
+  chip.classList.add('active');
+}
+
+function closeModelDropdown(){
+  const dd=$('composerModelDropdown');
+  const chip=$('composerModelChip');
+  if(dd) dd.classList.remove('open');
+  if(chip) chip.classList.remove('active');
+}
+
+document.addEventListener('click',e=>{
+  if(!e.target.closest('#composerModelChip') && !e.target.closest('#composerModelDropdown')) closeModelDropdown();
+});
+window.addEventListener('resize',()=>{
+  const dd=$('composerModelDropdown');
+  if(dd&&dd.classList.contains('open')) _positionModelDropdown();
+});
 
 // ── Scroll pinning ──────────────────────────────────────────────────────────
 // When streaming, auto-scroll only if the user hasn't manually scrolled up.
@@ -86,30 +295,59 @@ function _fmtTokens(n){if(!n||n<0)return'0';if(n>=1e6)return(n/1e6).toFixed(1)+'
 
 // Context usage indicator in composer footer
 function _syncCtxIndicator(usage){
+  const wrap=$('ctxIndicatorWrap');
   const el=$('ctxIndicator');
   if(!el)return;
   const promptTok=usage.last_prompt_tokens||usage.input_tokens||0;
+  const totalTok=(usage.input_tokens||0)+(usage.output_tokens||0);
   const ctxWindow=usage.context_length||0;
-  if(!promptTok||!ctxWindow){el.style.display='none';return;}
-  el.style.display='';
-  const pct=Math.min(100,Math.round((promptTok/ctxWindow)*100));
-  const bar=$('ctxBar');
-  const label=$('ctxLabel');
-  if(bar){
-    bar.style.width=pct+'%';
-    bar.className='ctx-bar'+(pct>75?' ctx-high':pct>50?' ctx-mid':'');
+  const cost=usage.estimated_cost;
+  // Show indicator whenever we have any usage data (tokens or cost)
+  if(!promptTok&&!totalTok&&!cost){
+    if(wrap) wrap.style.display='none';
+    return;
   }
-  if(label){
-    const cost=usage.estimated_cost;
-    let text=`${_fmtTokens(promptTok)} / ${_fmtTokens(ctxWindow)}`;
-    if(pct>0) text+=` (${pct}%)`;
-    if(cost) text+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
-    label.textContent=text;
+  if(wrap) wrap.style.display='';
+  const hasCtxWindow=!!(promptTok&&ctxWindow);
+  const pct=hasCtxWindow?Math.min(100,Math.round((promptTok/ctxWindow)*100)):0;
+  const ring=$('ctxRingValue');
+  const center=$('ctxPercent');
+  const usageLine=$('ctxTooltipUsage');
+  const tokensLine=$('ctxTooltipTokens');
+  const thresholdLine=$('ctxTooltipThreshold');
+  const costLine=$('ctxTooltipCost');
+  if(ring){
+    const circumference=61.261056745;
+    ring.style.strokeDasharray=String(circumference);
+    ring.style.strokeDashoffset=String(circumference*(1-pct/100));
   }
-  // Update title with detailed info
+  if(center) center.textContent=hasCtxWindow?String(pct):'\u00b7';
+  el.classList.toggle('ctx-mid',pct>50&&pct<=75);
+  el.classList.toggle('ctx-high',pct>75);
+  let label=hasCtxWindow?`Context window ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
+  if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+  el.setAttribute('aria-label',label);
+  if(usageLine) usageLine.textContent=hasCtxWindow?`${pct}% used (${Math.max(0,100-pct)}% left)`:`${_fmtTokens(totalTok)} tokens used`;
+  if(tokensLine) tokensLine.textContent=hasCtxWindow?`${_fmtTokens(promptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
   const threshold=usage.threshold_tokens||0;
-  el.title=`Context: ${_fmtTokens(promptTok)} of ${_fmtTokens(ctxWindow)} tokens used`
-    +(threshold?`\nAuto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`:'');
+  if(thresholdLine){
+    if(threshold&&ctxWindow){
+      thresholdLine.style.display='';
+      thresholdLine.textContent=`Auto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`;
+    }else{
+      thresholdLine.style.display='none';
+      thresholdLine.textContent='';
+    }
+  }
+  if(costLine){
+    if(cost){
+      costLine.style.display='';
+      costLine.textContent=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+    }else{
+      costLine.style.display='none';
+      costLine.textContent='';
+    }
+  }
 }
 
 function scrollIfPinned(){
@@ -162,13 +400,30 @@ function getModelLabel(modelId){
 
 function renderMd(raw){
   let s=raw||'';
+  // Pre-pass: decode HTML entities first so markdown processing works correctly.
+  // This prevents double-escaping when LLM outputs entities like &lt; &gt; &amp;
+  const decode=s=>s.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+  s=decode(s);
   // Pre-pass: convert safe inline HTML tags the model may emit into their
   // markdown equivalents so the pipeline can render them correctly.
   // Only runs OUTSIDE fenced code blocks and backtick spans (stash + restore).
   // Unsafe tags (anything not in the allowlist) are left as-is and will be
   // HTML-escaped by esc() when they reach an innerHTML assignment -- no XSS risk.
+  // Fence stash: protect code blocks and backtick spans from all further processing
+  // Must run BEFORE math_stash so $..$ inside code spans is not extracted as math
   const fence_stash=[];
   s=s.replace(/(```[\s\S]*?```|`[^`\n]+`)/g,m=>{fence_stash.push(m);return '\x00F'+(fence_stash.length-1)+'\x00';});
+  // Math stash: protect $$..$$ and $..$ from markdown processing
+  // Runs AFTER fence_stash so backtick code spans protect their dollar-sign contents
+  const math_stash=[];
+  // Display math: $$...$$  (must come before inline to avoid mis-parsing)
+  s=s.replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Inline math: $...$ — require non-space at boundaries to avoid false positives
+  // e.g. "costs $5 and $10" should not trigger (space after opening $)
+  s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Also stash \(...\) and \[...\] LaTeX delimiters
+  s=s.replace(/\\\\\((.+?)\\\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  s=s.replace(/\\\\\[(.+?)\\\\\]/gs,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Safe tag → markdown equivalent (these produce the same output as **text** etc.)
   s=s.replace(/<strong>([\s\S]*?)<\/strong>/gi,(_,t)=>'**'+t+'**');
   s=s.replace(/<b>([\s\S]*?)<\/b>/gi,(_,t)=>'**'+t+'**');
@@ -194,6 +449,7 @@ function renderMd(raw){
     t=t.replace(/\*([^*\n]+)\*/g,(_,x)=>`<em>${esc(x)}</em>`);
     t=t.replace(/`([^`\n]+)`/g,(_,x)=>`<code>${esc(x)}</code>`);
     t=t.replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,(_,lb,u)=>`<a href="${esc(u)}" target="_blank" rel="noopener">${esc(lb)}</a>`);
+    t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${esc(clean)}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     // Escape any plain text that isn't already wrapped in a tag we produced
     // by escaping bare < > that aren't part of our own tags
     const SAFE_INLINE=/^<\/?(strong|em|code|a)([\s>]|$)/i;
@@ -234,8 +490,8 @@ function renderMd(raw){
     if(rows.length<2)return block;
     const isSep=r=>/^\|[\s|:-]+\|$/.test(r.trim());
     if(!isSep(rows[1]))return block;
-    const parseRow=r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>`<td>${esc(c.trim())}</td>`).join('');
-    const parseHeader=r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>`<th>${esc(c.trim())}</th>`).join('');
+    const parseRow=r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>`<td>${inlineMd(c.trim())}</td>`).join('');
+    const parseHeader=r=>r.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>`<th>${inlineMd(c.trim())}</th>`).join('');
     const header=`<tr>${parseHeader(rows[0])}</tr>`;
     const body=rows.slice(2).map(r=>`<tr>${parseRow(r)}</tr>`).join('');
     return `<table><thead>${header}</thead><tbody>${body}</tbody></table>`;
@@ -244,93 +500,297 @@ function renderMd(raw){
   // Our pipeline only emits: <strong>,<em>,<code>,<pre>,<h1-6>,<ul>,<ol>,<li>,
   // <table>,<thead>,<tbody>,<tr>,<th>,<td>,<hr>,<blockquote>,<p>,<br>,<a>,
   // <div class="..."> (mermaid/pre-header). Everything else is untrusted input.
-  const SAFE_TAGS=/^<\/?(strong|em|code|pre|h[1-6]|ul|ol|li|table|thead|tbody|tr|th|td|hr|blockquote|p|br|a|div)([\s>]|$)/i;
+  const SAFE_TAGS=/^<\/?(strong|em|code|pre|h[1-6]|ul|ol|li|table|thead|tbody|tr|th|td|hr|blockquote|p|br|a|div|span)([\s>]|$)/i;
   s=s.replace(/<\/?[a-z][^>]*>/gi,tag=>SAFE_TAGS.test(tag)?tag:esc(tag));
+  // Autolink: convert plain URLs to clickable links (not inside existing <a> tags, not in code)
+  s=s.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{
+    // Strip trailing punctuation that was likely not part of the URL
+    const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
+    const clean=trail?url.slice(0,-1):url;
+    return `<a href="${esc(clean)}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
+  });
+  // Restore math stash → katex placeholder spans/divs
+  // These will be rendered by renderKatexBlocks() after DOM insertion
+  s=s.replace(/\x00M(\d+)\x00/g,(_,i)=>{
+    const item=math_stash[+i];
+    if(item.type==='display'){
+      return `<div class="katex-block" data-katex="display">${esc(item.src)}</div>`;
+    }
+    return `<span class="katex-inline" data-katex="inline">${esc(item.src)}</span>`;
+  });
   const parts=s.split(/\n{2,}/);
   s=parts.map(p=>{p=p.trim();if(!p)return '';if(/^<(h[1-6]|ul|ol|pre|hr|blockquote)/.test(p))return p;return `<p>${p.replace(/\n/g,'<br>')}</p>`;}).join('\n');
   return s;
 }
 
 function setStatus(t){
-  const bar=$('activityBar');
-  const txt=$('activityText');
-  const dismiss=$('btnDismissStatus');
-  if(!bar||!txt)return;
-  if(!t){
-    bar.style.display='none';
-    txt.textContent='';
-    if(dismiss)dismiss.style.display='none';
-  } else {
-    txt.textContent=t;
-    bar.style.display='';
-    // Show dismiss X only for static/error messages, not transient busy ones
-    const transient = t.endsWith('…') || t === 'Hermes is thinking…';
-    if(dismiss)dismiss.style.display=(!transient && !S.busy)?'inline':'none';
-  }
+  if(!t)return;
+  showToast(t, 4000);
 }
+
+function setComposerStatus(t){
+  const el=$('composerStatus');
+  if(!el)return;
+  if(!t){
+    el.style.display='none';
+    el.textContent='';
+    return;
+  }
+  el.textContent=t;
+  el.style.display='';
+}
+
 function updateSendBtn(){
   const btn=$('btnSend');
   if(!btn) return;
   const hasContent=$('msg').value.trim().length>0||S.pendingFiles.length>0;
-  const shouldShow=hasContent&&!S.busy;
-  if(shouldShow&&btn.style.display==='none'){
-    btn.style.display='';
-    // Remove then re-add class to retrigger animation each time
+  const canSend=hasContent&&!S.busy;
+  // Hide while busy (cancel button takes its place); show otherwise
+  btn.style.display=S.busy?'none':'';
+  btn.disabled=!canSend;
+  if(canSend&&!btn.classList.contains('visible')){
     btn.classList.remove('visible');
     requestAnimationFrame(()=>btn.classList.add('visible'));
-  } else if(!shouldShow&&btn.style.display!=='none'){
-    btn.style.display='none';
-    btn.classList.remove('visible');
   }
 }
 function setBusy(v){
   S.busy=v;
-  $('btnSend').disabled=v;
   updateSendBtn();
-  const dots=$('activityDots');
-  if(dots) dots.style.display=v?'flex':'none';
   if(!v){
     setStatus('');
+    setComposerStatus('');
     // Always hide Cancel button when not busy
     const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
-    updateQueueBadge();
-    // Drain one queued message after UI settles
-    if(MSG_QUEUE.length>0){
-      const next=MSG_QUEUE.shift();
-      updateQueueBadge();
-      setTimeout(()=>{ $('msg').value=next; send(); }, 120);
+    const sid=S.session&&S.session.session_id;
+    updateQueueBadge(sid);
+    // Drain one queued message for the currently viewed session after UI settles
+    const next=sid?shiftQueuedSessionMessage(sid):null;
+    if(next){
+      updateQueueBadge(sid);
+      setTimeout(()=>{
+        $('msg').value=next.text||'';
+        S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
+        autoResize();
+        renderTray();
+        send();
+      },120);
     }
   }
 }
 
-function updateQueueBadge(){
+function updateQueueBadge(sessionId){
+  const sid=sessionId||(S.session&&S.session.session_id);
+  const count=sid?getQueuedSessionCount(sid):0;
   let badge=$('queueBadge');
-  if(MSG_QUEUE.length>0){
+  if(count>0){
     if(!badge){
       badge=document.createElement('div');
       badge.id='queueBadge';
       badge.style.cssText='position:fixed;bottom:80px;right:24px;background:rgba(124,185,255,.18);border:1px solid rgba(124,185,255,.4);color:var(--blue);font-size:12px;font-weight:600;padding:6px 14px;border-radius:20px;z-index:50;pointer-events:none;backdrop-filter:blur(8px);';
       document.body.appendChild(badge);
     }
-    badge.textContent=MSG_QUEUE.length===1?'1 message queued':`${MSG_QUEUE.length} messages queued`;
-  } else {
-    if(badge) badge.remove();
+    badge.textContent=count===1?'1 message queued':`${count} messages queued`;
+  } else if(badge) {
+    badge.remove();
   }
 }
 function showToast(msg,ms){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),ms||2800);}
+
+// ── Shared app dialogs ───────────────────────────────────────────────────────
+// showConfirmDialog(opts) and showPromptDialog(opts) replace browser-native dialog calls
+// throughout the UI. Both return Promises and support: title, message, confirmLabel,
+// cancelLabel, danger (confirm only), placeholder/value/inputType (prompt only).
+
+const APP_DIALOG={resolve:null,kind:null,lastFocus:null};
+let _appDialogBound=false;
+
+function _isAppDialogOpen(){
+  const overlay=$('appDialogOverlay');
+  return !!(overlay&&overlay.style.display!=='none');
+}
+
+function _getAppDialogFocusable(){
+  return [$('appDialogInput'), $('appDialogCancel'), $('appDialogConfirm'), $('appDialogClose')]
+    .filter(el=>el&&el.style.display!=='none'&&!el.disabled);
+}
+
+function _finishAppDialog(result, restoreFocus=true){
+  const overlay=$('appDialogOverlay');
+  const dialog=$('appDialog');
+  const input=$('appDialogInput');
+  const confirmBtn=$('appDialogConfirm');
+  const resolve=APP_DIALOG.resolve;
+  const lastFocus=APP_DIALOG.lastFocus;
+  APP_DIALOG.resolve=null;
+  APP_DIALOG.kind=null;
+  APP_DIALOG.lastFocus=null;
+  if(overlay){overlay.style.display='none';overlay.setAttribute('aria-hidden','true');}
+  if(dialog) dialog.setAttribute('role','dialog');
+  if(input){input.value='';input.style.display='none';input.placeholder='';}
+  if(confirmBtn){confirmBtn.classList.remove('danger');confirmBtn.textContent=t('dialog_confirm_btn');}
+  if(restoreFocus&&lastFocus&&typeof lastFocus.focus==='function'){setTimeout(()=>lastFocus.focus(),0);}
+  if(resolve) resolve(result);
+}
+
+function _ensureAppDialogBindings(){
+  if(_appDialogBound) return;
+  _appDialogBound=true;
+  const overlay=$('appDialogOverlay');
+  const cancelBtn=$('appDialogCancel');
+  const confirmBtn=$('appDialogConfirm');
+  const closeBtn=$('appDialogClose');
+  if(overlay){
+    overlay.addEventListener('click',e=>{
+      if(e.target===overlay) _finishAppDialog(APP_DIALOG.kind==='prompt'?null:false);
+    });
+  }
+  if(cancelBtn) cancelBtn.addEventListener('click',()=>_finishAppDialog(APP_DIALOG.kind==='prompt'?null:false));
+  if(closeBtn)  closeBtn.addEventListener('click',()=>_finishAppDialog(APP_DIALOG.kind==='prompt'?null:false));
+  if(confirmBtn){
+    confirmBtn.addEventListener('click',()=>{
+      if(APP_DIALOG.kind==='prompt'){
+        const input=$('appDialogInput');
+        _finishAppDialog(input?input.value:null);
+      }else{
+        _finishAppDialog(true);
+      }
+    });
+  }
+  document.addEventListener('keydown',e=>{
+    if(!_isAppDialogOpen()) return;
+    if(e.key==='Escape'){
+      e.preventDefault();
+      _finishAppDialog(APP_DIALOG.kind==='prompt'?null:false);
+      return;
+    }
+    if(e.key==='Enter'){
+      const target=e.target;
+      const isTextarea=target&&target.tagName==='TEXTAREA';
+      if(!isTextarea){
+        e.preventDefault();
+        if(target===cancelBtn||target===closeBtn){
+          _finishAppDialog(APP_DIALOG.kind==='prompt'?null:false);
+        }else if(APP_DIALOG.kind==='prompt'){
+          const input=$('appDialogInput');
+          _finishAppDialog(input?input.value:null);
+        }else{
+          _finishAppDialog(true);
+        }
+      }
+      return;
+    }
+    if(e.key==='Tab'){
+      const nodes=_getAppDialogFocusable();
+      if(!nodes.length) return;
+      const idx=nodes.indexOf(document.activeElement);
+      let nextIdx=idx;
+      if(e.shiftKey){nextIdx=idx<=0?nodes.length-1:idx-1;}
+      else{nextIdx=idx===-1||idx===nodes.length-1?0:idx+1;}
+      e.preventDefault();
+      nodes[nextIdx].focus();
+    }
+  }, true);
+}
+
+function showConfirmDialog(opts={}){
+  _ensureAppDialogBindings();
+  if(APP_DIALOG.resolve) _finishAppDialog(false,false);
+  const overlay=$('appDialogOverlay'),dialog=$('appDialog'),title=$('appDialogTitle'),
+    desc=$('appDialogDesc'),input=$('appDialogInput'),cancelBtn=$('appDialogCancel'),confirmBtn=$('appDialogConfirm');
+  APP_DIALOG.resolve=null;APP_DIALOG.kind='confirm';APP_DIALOG.lastFocus=document.activeElement;
+  if(title) title.textContent=opts.title||t('dialog_confirm_title');
+  if(desc) desc.textContent=opts.message||'';
+  if(input){input.style.display='none';input.value='';}
+  if(cancelBtn) cancelBtn.textContent=opts.cancelLabel||t('cancel');
+  if(confirmBtn){
+    confirmBtn.textContent=opts.confirmLabel||t('dialog_confirm_btn');
+    confirmBtn.classList.toggle('danger',!!opts.danger);
+  }
+  if(dialog) dialog.setAttribute('role',opts.danger?'alertdialog':'dialog');
+  if(overlay){overlay.style.display='flex';overlay.setAttribute('aria-hidden','false');}
+  return new Promise(resolve=>{
+    APP_DIALOG.resolve=resolve;
+    setTimeout(()=>((opts.focusCancel?cancelBtn:confirmBtn)||confirmBtn||cancelBtn).focus(),0);
+  });
+}
+
+function showPromptDialog(opts={}){
+  _ensureAppDialogBindings();
+  if(APP_DIALOG.resolve) _finishAppDialog(null,false);
+  const overlay=$('appDialogOverlay'),dialog=$('appDialog'),title=$('appDialogTitle'),
+    desc=$('appDialogDesc'),input=$('appDialogInput'),cancelBtn=$('appDialogCancel'),confirmBtn=$('appDialogConfirm');
+  APP_DIALOG.resolve=null;APP_DIALOG.kind='prompt';APP_DIALOG.lastFocus=document.activeElement;
+  if(title) title.textContent=opts.title||t('dialog_prompt_title');
+  if(desc) desc.textContent=opts.message||'';
+  if(input){
+    input.type=opts.inputType||'text';input.style.display='';
+    input.value=opts.value||'';input.placeholder=opts.placeholder||'';
+    input.autocomplete='off';input.spellcheck=false;
+  }
+  if(cancelBtn) cancelBtn.textContent=opts.cancelLabel||t('cancel');
+  if(confirmBtn){confirmBtn.textContent=opts.confirmLabel||t('create');confirmBtn.classList.remove('danger');}
+  if(dialog) dialog.setAttribute('role','dialog');
+  if(overlay){overlay.style.display='flex';overlay.setAttribute('aria-hidden','false');}
+  return new Promise(resolve=>{
+    APP_DIALOG.resolve=resolve;
+    setTimeout(()=>{if(input&&input.style.display!=='none')input.focus();else if(confirmBtn)confirmBtn.focus();},0);
+  });
+}
+
 
 function copyMsg(btn){
   const row=btn.closest('.msg-row');
   const text=row?row.dataset.rawText:'';
   if(!text)return;
   navigator.clipboard.writeText(text).then(()=>{
-    const orig=btn.innerHTML;btn.innerHTML='&#10003;';btn.style.color='var(--blue)';
+    const orig=btn.innerHTML;btn.innerHTML=li('check',13);btn.style.color='var(--blue)';
     setTimeout(()=>{btn.innerHTML=orig;btn.style.color='';},1500);
   }).catch(()=>showToast('Copy failed'));
 }
 
 // ── Reconnect banner (B4/B5: reload resilience) ──
 const INFLIGHT_KEY = 'hermes-webui-inflight'; // localStorage key for in-flight session tracking
+const INFLIGHT_STATE_KEY = 'hermes-webui-inflight-state'; // localStorage snapshots for mid-stream reload recovery
+
+function _readInflightStateMap(){
+  try{
+    const raw=localStorage.getItem(INFLIGHT_STATE_KEY);
+    const parsed=raw?JSON.parse(raw):{};
+    return parsed&&typeof parsed==='object'?parsed:{};
+  }catch(_){
+    return {};
+  }
+}
+function saveInflightState(sid, state){
+  if(!sid||!state) return;
+  try{
+    const all=_readInflightStateMap();
+    all[sid]={...state,updated_at:Date.now()};
+    localStorage.setItem(INFLIGHT_STATE_KEY, JSON.stringify(all));
+  }catch(_){ }
+}
+function loadInflightState(sid, streamId){
+  if(!sid) return null;
+  const all=_readInflightStateMap();
+  const entry=all[sid];
+  if(!entry) return null;
+  if(streamId&&entry.streamId&&entry.streamId!==streamId) return null;
+  if(entry.updated_at&&Date.now()-entry.updated_at>10*60*1000){
+    clearInflightState(sid);
+    return null;
+  }
+  return entry;
+}
+function clearInflightState(sid){
+  if(!sid) return;
+  try{
+    const all=_readInflightStateMap();
+    if(!(sid in all)) return;
+    delete all[sid];
+    if(Object.keys(all).length) localStorage.setItem(INFLIGHT_STATE_KEY, JSON.stringify(all));
+    else localStorage.removeItem(INFLIGHT_STATE_KEY);
+  }catch(_){ }
+}
 
 function markInflight(sid, streamId) {
   localStorage.setItem(INFLIGHT_KEY, JSON.stringify({sid, streamId, ts: Date.now()}));
@@ -352,11 +812,11 @@ async function refreshSession() {
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
-    S.messages = (data.session.messages || []).filter(m => {
-      if (!m || !m.role || m.role === 'tool') return false;
-      if (m.role === 'assistant') { let c = m.content || ''; if (Array.isArray(c)) c = c.map(p => p.text||'').join(''); return String(c).trim().length > 0; }
-      return true;
-    });
+    S.messages = data.session.messages || [];
+    const pendingMsg=getPendingSessionMessage(data.session);
+    if(pendingMsg) S.messages.push(pendingMsg);
+    S.activeStreamId=data.session.active_stream_id||null;
+
     syncTopbar(); renderMessages();
     showToast('Conversation refreshed');
   } catch(e) { setStatus('Refresh failed: ' + e.message); }
@@ -402,24 +862,46 @@ async function applyUpdates(){
   }
 }
 
+function getPendingSessionMessage(session){
+  const text=String(session?.pending_user_message||'').trim();
+  if(!text) return null;
+  const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
+  const messages=Array.isArray(session?.messages)?session.messages:[];
+  const lastUser=[...messages].reverse().find(m=>m&&m.role==='user');
+  if(lastUser){
+    const lastText=String(msgContent(lastUser)||'').trim();
+    if(lastText===text){
+      if(attachments.length&&!lastUser.attachments?.length) lastUser.attachments=attachments;
+      return null;
+    }
+  }
+  return {
+    role:'user',
+    content:text,
+    attachments:attachments.length?attachments:undefined,
+    _ts:session?.pending_started_at||Date.now()/1000,
+    _pending:true,
+  };
+}
 async function checkInflightOnBoot(sid) {
   const raw = localStorage.getItem(INFLIGHT_KEY);
   if (!raw) return;
   try {
     const {sid: inflightSid, streamId, ts} = JSON.parse(raw);
     if (inflightSid !== sid) { clearInflight(); return; }
+    if (S.activeStreamId && S.activeStreamId === streamId) return;
     // Only show banner if the in-flight entry is less than 10 minutes old
     if (Date.now() - ts > 10 * 60 * 1000) { clearInflight(); return; }
     // Check if stream is still active
     const status = await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId || '')}`);
     if (status.active) {
       // Stream is genuinely still running -- show the banner
-      showReconnectBanner('A response is still being generated. Reload when ready?');
+      showReconnectBanner(t('reconnect_active'));
     } else {
       // Stream finished. Only show banner if reload happened within 90 seconds
       // (longer gap = normal completed session, not a mid-stream reload)
       if (Date.now() - ts < 90 * 1000) {
-        showReconnectBanner('A response was in progress when you last left. Messages may have updated.');
+        showReconnectBanner(t('reconnect_finished'));
       } else {
         clearInflight();  // completed normally, no banner needed
       }
@@ -429,52 +911,53 @@ async function checkInflightOnBoot(sid) {
 
 function syncTopbar(){
   if(!S.session){
-    document.title='Hermes';
-    // Show default workspace name even without a session
-    const sidebarName=$('sidebarWsName');
-    if(sidebarName && sidebarName.textContent==='Workspace'){
-      sidebarName.textContent='No workspace';
+    document.title=window._botName||'Hermes';
+    if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
+    if(typeof syncModelChip==='function') syncModelChip();
+    if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
+    else {
+      const sidebarName=$('sidebarWsName');
+      if(sidebarName && sidebarName.textContent==='Workspace'){
+        sidebarName.textContent=t('no_workspace');
+      }
     }
     return;
   }
-  const sessionTitle=S.session.title||'Untitled';
+  const sessionTitle=S.session.title||t('untitled');
   $('topbarTitle').textContent=sessionTitle;
-  document.title=sessionTitle+' \u2014 Hermes';
+  document.title=sessionTitle+' \u2014 '+(window._botName||'Hermes');
   const vis=S.messages.filter(m=>m&&m.role&&m.role!=='tool');
-  $('topbarMeta').textContent=`${vis.length} messages`;
+  $('topbarMeta').textContent=t('n_messages',vis.length);
   // If a profile switch just happened, apply its model rather than the session's stale value.
   // S._pendingProfileModel is set by switchToProfile() and cleared here after one application.
   const modelOverride=S._pendingProfileModel;
+  let currentModel=S.session.model||'';
   if(modelOverride){
     S._pendingProfileModel=null;
     _applyModelToDropdown(modelOverride,$('modelSelect'));
+    currentModel=modelOverride;
   } else {
-    const m=S.session.model||'';
-    const applied=_applyModelToDropdown(m,$('modelSelect'));
-    // If the model isn't in the list at all, add it so the session value is preserved
-    if(!applied && m){
+    const applied=_applyModelToDropdown(currentModel,$('modelSelect'));
+    // If the model isn't in the current provider list, add it as a visually marked
+    // "(unavailable)" entry so the session value is preserved without misleading the user.
+    // Selecting it will still attempt to send (same as before), but the label makes
+    // clear it's a stale model from a previous session.
+    if(!applied && currentModel){
       const opt=document.createElement('option');
-      opt.value=m;
-      opt.textContent=getModelLabel(m);
+      opt.value=currentModel;
+      opt.textContent=getModelLabel(currentModel)+t('model_unavailable');
+      opt.style.color='var(--muted, #888)';
+      opt.title=t('model_unavailable_title');
       $('modelSelect').appendChild(opt);
-      $('modelSelect').value=m;
+      $('modelSelect').value=currentModel;
     }
   }
+  if(typeof syncModelChip==='function') syncModelChip();
   // Show Clear button only when session has messages
   const clearBtn=$('btnClearConv');
   if(clearBtn) clearBtn.style.display=(S.messages&&S.messages.filter(msg=>msg.role!=='tool').length>0)?'':'none';
-  const displayModel=$('modelSelect').value||m;
-  $('modelChip').textContent=getModelLabel(displayModel);
-  const ws=S.session.workspace||'';
-  // Update sidebar workspace display
-  const sidebarName=$('sidebarWsName');
-  const sidebarPath=$('sidebarWsPath');
-  if(sidebarName){
-    sidebarName.textContent=getWorkspaceFriendlyName(ws);
-  }
-  if(sidebarPath){
-    sidebarPath.textContent=ws;
-  }
+  if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
+  if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
   // modelSelect already set above
   // Update profile chip label
   const profileLabel=$('profileChipLabel');
@@ -492,16 +975,24 @@ function renderMessages(){
   const inner=$('msgInner');
   const vis=S.messages.filter(m=>{
     if(!m||!m.role||m.role==='tool')return false;
+    // Keep assistant messages with tool_use content even if they have no text,
+    // so tool cards can be anchored to their DOM rows on page reload (#140).
+    if(m.role==='assistant'&&Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use'))return true;
     return msgContent(m)||m.attachments?.length;
   });
   $('emptyState').style.display=vis.length?'none':'';
   inner.innerHTML='';
-  // Track original indices (in S.messages) so truncate knows the cut point
+  // Track original indices (in S.messages) so truncate knows the cut point.
+  // Also include assistant messages that have tool_calls (OpenAI format) or
+  // tool_use content (Anthropic format) even when their text is empty — these
+  // rows serve as DOM anchors for tool card insertion on page reload.
   const visWithIdx=[];
   let rawIdx=0;
   for(const m of S.messages){
     if(!m||!m.role||m.role==='tool'){rawIdx++;continue;}
-    if(msgContent(m)||m.attachments?.length) visWithIdx.push({m,rawIdx});
+    const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+    const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+    if(msgContent(m)||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu))) visWithIdx.push({m,rawIdx});
     rawIdx++;
   }
   for(let vi=0;vi<visWithIdx.length;vi++){
@@ -513,32 +1004,77 @@ function renderMessages(){
       thinkingText=content.filter(p=>p&&(p.type==='thinking'||p.type==='reasoning')).map(p=>p.thinking||p.reasoning||p.text||'').join('\n');
       content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
     }
+    // Also check top-level reasoning field (Hermes format)
+    if(!thinkingText && m.reasoning){
+      thinkingText=m.reasoning;
+    }
+    // Parse inline thinking tags from plain text: <think>...</think> (DeepSeek, QwQ, MiniMax, etc.)
+    // and Gemma 4 channel tokens: <|channel>thought\n...<channel|>
+    // Note: no ^ anchor — some models emit leading whitespace/newlines before <think>.
+    if(!thinkingText && typeof content==='string'){
+      const thinkMatch=content.match(/<think>([\s\S]*?)<\/think>/);
+      if(thinkMatch){
+        thinkingText=thinkMatch[1].trim();
+        content=content.replace(/<think>[\s\S]*?<\/think>\s*/,'').trimStart();
+      }
+      if(!thinkingText){
+        const gemmaMatch=content.match(/<\|channel>thought\n([\s\S]*?)<channel\|>/);
+        if(gemmaMatch){
+          thinkingText=gemmaMatch[1].trim();
+          content=content.replace(/<\|channel>thought\n[\s\S]*?<channel\|>\s*/,'').trimStart();
+        }
+      }
+    }
     const isUser=m.role==='user';
     const isLastAssistant=!isUser&&vi===visWithIdx.length-1;
     // Render thinking card before the assistant message (collapsed by default)
     if(thinkingText&&!isUser){
       const thinkRow=document.createElement('div');thinkRow.className='msg-row thinking-card-row';
-      thinkRow.innerHTML=`<div class="thinking-card"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">&#128161;</span><span class="thinking-card-label">Thinking</span><span class="thinking-card-toggle">&#9656;</span></div><div class="thinking-card-body"><pre>${esc(thinkingText)}</pre></div></div>`;
+      thinkRow.innerHTML=`<div class="thinking-card"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(thinkingText)}</pre></div></div>`;
       inner.appendChild(thinkRow);
     }
     const row=document.createElement('div');row.className='msg-row';
     row.dataset.msgIdx=rawIdx;row.dataset.role=m.role||'assistant';
+    if(m._live) row.setAttribute('data-live-assistant','1');
     let filesHtml='';
     if(m.attachments&&m.attachments.length)
-      filesHtml=`<div class="msg-files">${m.attachments.map(f=>`<div class="msg-file-badge">&#128206; ${esc(f)}</div>`).join('')}</div>`;
+      filesHtml=`<div class="msg-files">${m.attachments.map(f=>`<div class="msg-file-badge">${li('paperclip',12)} ${esc(f)}</div>`).join('')}</div>`;
     const bodyHtml = isUser ? esc(String(content)).replace(/\n/g,'<br>') : renderMd(String(content));
     // Action buttons for this bubble
-    const editBtn  = isUser  ? `<button class="msg-action-btn" title="Edit message" onclick="editMessage(this)">&#9998;</button>` : '';
-    const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="Regenerate response" onclick="regenerateResponse(this)">&#8635;</button>` : '';
+    const editBtn  = isUser  ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
+    const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     const tsTitle=tsVal?new Date(tsVal*1000).toLocaleString():'';
-    row.innerHTML=`<div class="msg-role ${m.role}" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon ${m.role}">${isUser?'Y':'H'}</div><span style="font-size:12px">${isUser?'You':'Hermes'}</span>${tsTitle?`<span class="msg-time">${new Date(tsVal*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>`:''}<span class="msg-actions">${editBtn}<button class="msg-copy-btn msg-action-btn" title="Copy" onclick="copyMsg(this)">&#128203;</button>${retryBtn}</span></div>${filesHtml}<div class="msg-body">${bodyHtml}</div>`;
+    const _bn=window._botName||'Hermes';
+    row.innerHTML=`<div class="msg-role ${m.role}" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon ${m.role}">${isUser?'Y':esc(_bn.charAt(0).toUpperCase())}</div><span style="font-size:12px">${isUser?t('you'):esc(_bn)}</span>${tsTitle?`<span class="msg-time">${new Date(tsVal*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>`:''}<span class="msg-actions">${editBtn}<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>${retryBtn}</span></div>${filesHtml}<div class="msg-body">${bodyHtml}</div>`;
     row.dataset.rawText = String(content).trim();
     inner.appendChild(row);
   }
   // Insert settled tool call cards (history view only).
   // During live streaming, tool cards are rendered in #liveToolCards by the
   // tool SSE handler and never mixed into the message list until done fires.
+  //
+  // Fallback: if S.toolCalls is empty (sessions that predate session-level tool
+  // tracking, or runs that didn't go through the normal streaming path), build
+  // a display list from per-message tool_calls (OpenAI format) stored in each
+  // assistant message. This covers the reload case described in issue #140.
+  if(!S.busy && (!S.toolCalls||!S.toolCalls.length)){
+    const derived=[];
+    S.messages.forEach((m,rawIdx)=>{
+      if(m.role!=='assistant') return;
+      (m.tool_calls||[]).forEach(tc=>{
+        if(!tc||typeof tc!=='object') return;
+        const fn=tc.function||{};
+        const name=fn.name||tc.name||'tool';
+        let args={};
+        try{ args=JSON.parse(fn.arguments||'{}'); }catch(e){}
+        let argsSnap={};
+        Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
+        derived.push({name,snippet:'',tid:tc.id||tc.call_id||'',assistant_msg_idx:rawIdx,args:argsSnap,done:true});
+      });
+    });
+    if(derived.length) S.toolCalls=derived;
+  }
   if(!S.busy && S.toolCalls && S.toolCalls.length){
     inner.querySelectorAll('.tool-card-row').forEach(el=>el.remove());
     const byAssistant = {};
@@ -548,18 +1084,35 @@ function renderMessages(){
       byAssistant[key].push(tc);
     }
     const allRows = Array.from(inner.querySelectorAll('.msg-row[data-msg-idx]'));
+    // Track the last inserted node per anchor so back-to-back groups for the
+    // same (filtered) anchor row are inserted in chronological order.
+    const anchorInsertAfter = new Map();
     for(const [key, cards] of Object.entries(byAssistant)){
       const aIdx = parseInt(key);
-      let insertBefore = null;
-      if(aIdx === -1){
-        for(let i=allRows.length-1;i>=0;i--){
-          const ri=parseInt(allRows[i].dataset.msgIdx||'-1',10);
-          if(ri>=0&&S.messages[ri]&&S.messages[ri].role==='assistant'){insertBefore=allRows[i];break;}
-        }
-      } else {
+      // Find the right insertion point: cards go AFTER the assistant message
+      // that triggered them. We look for the row at aIdx, or the nearest
+      // visible ASSISTANT row at or before aIdx (the assistant message may be
+      // filtered out if it contained only tool_use blocks with no text response).
+      let anchorRow = null;
+      if(aIdx >= 0){
+        // First: exact match for the assistant row
         for(const r of allRows){
           const ri=parseInt(r.dataset.msgIdx||'-1');
-          if(ri>aIdx&&S.messages[ri]&&S.messages[ri].role==='assistant'){insertBefore=r;break;}
+          if(ri===aIdx){anchorRow=r;break;}
+        }
+        // Fallback: nearest visible ASSISTANT row at or before aIdx
+        if(!anchorRow){
+          for(let i=allRows.length-1;i>=0;i--){
+            const ri=parseInt(allRows[i].dataset.msgIdx||'-1');
+            if(ri<=aIdx&&S.messages[ri]&&S.messages[ri].role==='assistant'){anchorRow=allRows[i];break;}
+          }
+        }
+      }
+      // aIdx === -1 or no assistant anchor found: attach after the last assistant row
+      if(!anchorRow){
+        for(let i=allRows.length-1;i>=0;i--){
+          const ri=parseInt(allRows[i].dataset.msgIdx||'-1',10);
+          if(ri>=0&&S.messages[ri]&&S.messages[ri].role==='assistant'){anchorRow=allRows[i];break;}
         }
       }
       const frag=document.createDocumentFragment();
@@ -571,17 +1124,24 @@ function renderMessages(){
         // Collect card elements before they get moved to DOM
         const cardEls=Array.from(frag.querySelectorAll('.tool-card'));
         const expandBtn=document.createElement('button');
-        expandBtn.textContent='Expand all';
+        expandBtn.textContent=t('expand_all');
         expandBtn.onclick=()=>cardEls.forEach(c=>c.classList.add('open'));
         const collapseBtn=document.createElement('button');
-        collapseBtn.textContent='Collapse all';
+        collapseBtn.textContent=t('collapse_all');
         collapseBtn.onclick=()=>cardEls.forEach(c=>c.classList.remove('open'));
         toggle.appendChild(expandBtn);
         toggle.appendChild(collapseBtn);
         frag.insertBefore(toggle,frag.firstChild);
       }
-      if(insertBefore) inner.insertBefore(frag,insertBefore);
+      // Insert after the anchor row (or after any previously inserted group for
+      // the same anchor), preserving chronological order for multi-step chains.
+      const insertAfterNode = anchorInsertAfter.get(anchorRow) || anchorRow;
+      const refNode = insertAfterNode ? insertAfterNode.nextSibling : null;
+      if(refNode) inner.insertBefore(frag,refNode);
       else inner.appendChild(frag);
+      // Record the last child we inserted so the next group for this anchor
+      // goes after it rather than back at anchorRow.nextSibling.
+      anchorInsertAfter.set(anchorRow, inner.lastChild);
     }
   }
   // Render usage badge on the last assistant message row (if enabled and usage data exists)
@@ -603,7 +1163,7 @@ function renderMessages(){
   }
   scrollToBottom();
   // Apply syntax highlighting after DOM is built
-  requestAnimationFrame(()=>{highlightCode();addCopyButtons();renderMermaidBlocks();});
+  requestAnimationFrame(()=>{highlightCode();addCopyButtons();renderMermaidBlocks();renderKatexBlocks();});
   // Refresh todo panel if it's currently open
   if(typeof loadTodos==='function' && document.getElementById('panelTodos') && document.getElementById('panelTodos').classList.contains('active')){
     loadTodos();
@@ -611,12 +1171,26 @@ function renderMessages(){
 }
 
 function toolIcon(name){
-  const icons={terminal:'⬛',read_file:'📄',write_file:'✏️',search_files:'🔍',
-    web_search:'🌐',web_extract:'🌐',execute_code:'⚙️',patch:'🔧',
-    memory:'🧠',skill_manage:'📚',todo:'✅',cronjob:'⏱️',delegate_task:'🤖',
-    send_message:'💬',browser_navigate:'🌐',vision_analyze:'👁️',
-    subagent_progress:'🔀'};
-  return icons[name]||'🔧';
+  const icons={
+    terminal:        li('terminal'),
+    read_file:       li('file-text'),
+    write_file:      li('file-pen'),
+    search_files:    li('search'),
+    web_search:      li('globe'),
+    web_extract:     li('globe'),
+    execute_code:    li('play'),
+    patch:           li('wrench'),
+    memory:          li('brain'),
+    skill_manage:    li('book-open'),
+    todo:            li('list-todo'),
+    cronjob:         li('clock'),
+    delegate_task:   li('bot'),
+    send_message:    li('message-square'),
+    browser_navigate:li('globe'),
+    vision_analyze:  li('eye'),
+    subagent_progress:li('shuffle'),
+  };
+  return icons[name]||li('wrench');
 }
 
 function buildToolCard(tc){
@@ -639,12 +1213,12 @@ function buildToolCard(tc){
   const isSubagent=tc.name==='subagent_progress';
   const isDelegation=tc.name==='delegate_task';
   const cardClass='tool-card'+(tc.done===false?' tool-card-running':'')+(isSubagent?' tool-card-subagent':'');
-  // Clean up subagent preview: strip leading 🔀 emoji since the icon already shows it
+  // Clean up legacy subagent prefixes since the Lucide icon already shows it
   let displayName=tc.name;
   if(isSubagent) displayName='Subagent';
   if(isDelegation) displayName='Delegate task';
   let previewText=tc.preview||displaySnippet||'';
-  if(isSubagent) previewText=previewText.replace(/^🔀\s*/,'');
+  if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
   row.innerHTML=`
     <div class="${cardClass}">
       <div class="tool-card-header" onclick="this.closest('.tool-card').classList.toggle('open')">
@@ -754,7 +1328,7 @@ async function submitEdit(msgIdx, newText) {
     // Now send the edited message as a new chat
     $('msg').value = newText;
     await send();
-  } catch(e) { setStatus('Edit failed: ' + e.message); }
+  } catch(e) { setStatus(t('edit_failed') + e.message); }
 }
 
 async function regenerateResponse(btn) {
@@ -780,7 +1354,7 @@ async function regenerateResponse(btn) {
     renderMessages();
     $('msg').value = lastUserText;
     await send();
-  } catch(e) { setStatus('Regenerate failed: ' + e.message); }
+  } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
 function highlightCode(container) {
@@ -799,12 +1373,12 @@ function addCopyButtons(container){
     if(pre.querySelector('.code-copy-btn')) return;
     const btn=document.createElement('button');
     btn.className='code-copy-btn';
-    btn.textContent='Copy';
+    btn.textContent=t('copy');
     btn.onclick=(e)=>{
       e.stopPropagation();
       navigator.clipboard.writeText(codeEl.textContent).then(()=>{
-        btn.textContent='Copied!';
-        setTimeout(()=>{btn.textContent='Copy';},1500);
+        btn.textContent=t('copied');
+        setTimeout(()=>{btn.textContent=t('copy');},1500);
       });
     };
     const header=pre.previousElementSibling;
@@ -863,26 +1437,84 @@ function renderMermaidBlocks(){
   });
 }
 
-function appendThinking(){
-  $('emptyState').style.display='none';
-  const row=document.createElement('div');row.className='msg-row';row.id='thinkingRow';
-  row.innerHTML=`<div class="msg-role assistant"><div class="role-icon assistant">H</div>Hermes</div><div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
-  $('msgInner').appendChild(row);scrollToBottom();
+let _katexLoading=false;
+let _katexReady=false;
+
+function renderKatexBlocks(){
+  const blocks=document.querySelectorAll('.katex-block:not([data-rendered]),.katex-inline:not([data-rendered])');
+  if(!blocks.length) return;
+  if(!_katexReady){
+    if(!_katexLoading){
+      _katexLoading=true;
+      const script=document.createElement('script');
+      script.src='https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js';
+      script.integrity='sha384-cMkvdD8LoxVzGF/RPUKAcvmm49FQ0oxwDF3BGKtDXcEc+T1b2N+teh/OJfpU0jr6';
+      script.crossOrigin='anonymous';
+      script.onload=()=>{
+        if(typeof katex!=='undefined'){
+          _katexReady=true;
+          renderKatexBlocks();
+        }
+      };
+      document.head.appendChild(script);
+    }
+    return;
+  }
+  blocks.forEach(el=>{
+    el.dataset.rendered='true';
+    const src=el.textContent||'';
+    const displayMode=el.dataset.katex==='display';
+    try{
+      katex.render(src,el,{
+        displayMode,
+        throwOnError:false,
+        trust:false,
+        strict:'ignore',
+      });
+    }catch(e){
+      // Leave as raw text in a code span on failure
+      el.outerHTML=`<code>${esc(src)}</code>`;
+    }
+  });
 }
+
+function _thinkingMarkup(text=''){
+  const _bn=window._botName||'Hermes';
+  const icon=esc(_bn.charAt(0).toUpperCase());
+  const label=esc(_bn);
+  const body=(text&&String(text).trim())
+    ? `<div class="thinking-card open"><div class="thinking-card-header"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span></div><div class="thinking-card-body"><pre>${esc(String(text).trim())}</pre></div></div>`
+    : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+  return `<div class="msg-role assistant"><div class="role-icon assistant">${icon}</div>${label}</div>${body}`;
+}
+function appendThinking(text=''){
+  $('emptyState').style.display='none';
+  let row=$('thinkingRow');
+  if(!row){
+    row=document.createElement('div');
+    row.className='msg-row';
+    row.id='thinkingRow';
+    $('msgInner').appendChild(row);
+  }
+  row.className=(text&&String(text).trim())?'msg-row thinking-card-row':'msg-row';
+  row.innerHTML=_thinkingMarkup(text);
+  scrollToBottom();
+}
+function updateThinking(text=''){appendThinking(text);}
 function removeThinking(){const el=$('thinkingRow');if(el)el.remove();}
 
 function fileIcon(name, type){
-  if(type==='dir') return '📁';
+  if(type==='dir') return li('folder',14);
   const e=fileExt(name);
-  if(IMAGE_EXTS.has(e)) return '📷';
-  if(MD_EXTS.has(e))    return '📝';
-  if(typeof DOWNLOAD_EXTS!=='undefined'&&DOWNLOAD_EXTS.has(e)) return '⬇️';
-  if(e==='.py')   return '🐍';
-  if(e==='.js'||e==='.ts'||e==='.jsx'||e==='.tsx') return '⚡';
-  if(e==='.json'||e==='.yaml'||e==='.yml'||e==='.toml') return '⚙';
-  if(e==='.sh'||e==='.bash') return '💻';
-  if(e==='.pdf') return '⬇️';
-  return '📄';
+  if(IMAGE_EXTS.has(e)) return li('image',14);
+  if(MD_EXTS.has(e))    return li('file-text',14);
+  if(typeof DOWNLOAD_EXTS!=='undefined'&&DOWNLOAD_EXTS.has(e)) return li('download',14);
+  if(e==='.py')   return li('file-code',14);
+  if(e==='.js'||e==='.ts'||e==='.jsx'||e==='.tsx') return li('zap',14);
+  if(e==='.json'||e==='.yaml'||e==='.yml'||e==='.toml') return li('settings',14);
+  if(e==='.sh'||e==='.bash') return li('terminal',14);
+  if(e==='.pdf') return li('download',14);
+  return li('file-text',14);
 }
 
 function renderBreadcrumb(){
@@ -952,12 +1584,12 @@ function _renderTreeItems(container, entries, depth){
 
     // Icon
     const iconEl=document.createElement('span');
-    iconEl.className='file-icon';iconEl.textContent=fileIcon(item.name,item.type);
+    iconEl.className='file-icon';iconEl.innerHTML=fileIcon(item.name,item.type);
     el.appendChild(iconEl);
 
     // Name
     const nameEl=document.createElement('span');
-    nameEl.className='file-name';nameEl.textContent=item.name;nameEl.title='Double-click to rename';
+    nameEl.className='file-name';nameEl.textContent=item.name;nameEl.title=t('double_click_rename');
     nameEl.ondblclick=(e)=>{
       e.stopPropagation();
       // For directories, double-click navigates (breadcrumb view)
@@ -974,11 +1606,11 @@ function _renderTreeItems(container, entries, depth){
               await api('/api/file/rename',{method:'POST',body:JSON.stringify({
                 session_id:S.session.session_id,path:item.path,new_name:newName
               })});
-              showToast(`Renamed to ${newName}`);
+              showToast(t('renamed_to')+newName);
               // Invalidate cache and re-render
               delete S._dirCache[S.currentDir];
               await loadDir(S.currentDir);
-            }catch(err){showToast('Rename failed: '+err.message);}
+            }catch(err){showToast(t('rename_failed')+err.message);}
           }
         }
         inp.replaceWith(nameEl);
@@ -1004,7 +1636,7 @@ function _renderTreeItems(container, entries, depth){
     // Delete button -- for files
     if(item.type==='file'){
       const del=document.createElement('button');
-      del.className='file-del-btn';del.title='Delete';del.textContent='\u00d7';
+      del.className='file-del-btn';del.title=t('delete_title');del.textContent='\u00d7';
       del.onclick=async(e)=>{e.stopPropagation();await deleteWorkspaceFile(item.path,item.name);};
       el.appendChild(del);
     }
@@ -1045,7 +1677,7 @@ function _renderTreeItems(container, entries, depth){
         const empty=document.createElement('div');
         empty.className='file-item file-empty';
         empty.style.paddingLeft=(8+(depth+1)*16)+'px';
-        empty.textContent='(empty)';
+        empty.textContent=t('empty_dir');
         container.appendChild(empty);
       }
     }
@@ -1054,39 +1686,40 @@ function _renderTreeItems(container, entries, depth){
 
 async function deleteWorkspaceFile(relPath, name){
   if(!S.session)return;
-  if(!confirm(`Delete ${name}?`))return;
+  const _delFile=await showConfirmDialog({title:t('delete_confirm',name),message:'',confirmLabel:'Delete',danger:true,focusCancel:true});
+  if(!_delFile) return;
   try{
     await api('/api/file/delete',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
-    showToast(`Deleted ${name}`);
+    showToast(t('deleted')+name);
     // Close preview if we just deleted the viewed file
     if($('previewPathText').textContent===relPath)$('btnClearPreview').onclick();
     await loadDir(S.currentDir);
-  }catch(e){setStatus('Delete failed: '+e.message);}
+  }catch(e){setStatus(t('delete_failed')+e.message);}
 }
 
 async function promptNewFile(){
   if(!S.session)return;
-  const name=prompt('New file name (e.g. notes.md):','');
+  const name=await showPromptDialog({title:t('new_file_prompt'),placeholder:'filename.txt',confirmLabel:t('create')});
   if(!name||!name.trim())return;
   const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
   try{
     await api('/api/file/create',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath,content:''})});
-    showToast(`Created ${name.trim()}`);
+    showToast(t('created')+name.trim());
     await loadDir(S.currentDir);
     openFile(relPath);
-  }catch(e){setStatus('Create failed: '+e.message);}
+  }catch(e){setStatus(t('create_failed')+e.message);}
 }
 
 async function promptNewFolder(){
   if(!S.session)return;
-  const name=prompt('New folder name:','');
+  const name=await showPromptDialog({title:t('new_folder_prompt'),placeholder:'folder-name',confirmLabel:t('create')});
   if(!name||!name.trim())return;
   const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
   try{
     await api('/api/file/create-dir',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
-    showToast(`Created folder ${name.trim()}`);
+    showToast(t('folder_created')+name.trim());
     await loadDir(S.currentDir);
-  }catch(e){setStatus('Create folder failed: '+e.message);}
+  }catch(e){setStatus(t('folder_create_failed')+e.message);}
 }
 
 function renderTray(){
@@ -1096,7 +1729,7 @@ function renderTray(){
   updateSendBtn();
   S.pendingFiles.forEach((f,i)=>{
     const chip=document.createElement('div');chip.className='attach-chip';
-    chip.innerHTML=`&#128206; ${esc(f.name)} <button title="Remove">&#10005;</button>`;
+    chip.innerHTML=`${li('paperclip',12)} ${esc(f.name)} <button title="${t('remove_title')}">${li('x',12)}</button>`;
     chip.querySelector('button').onclick=()=>{S.pendingFiles.splice(i,1);renderTray();};
     tray.appendChild(chip);
   });
@@ -1118,11 +1751,11 @@ async function uploadPendingFiles(){
       const data=await res.json();
       if(data.error)throw new Error(data.error);
       names.push(data.filename);
-    }catch(e){failures++;setStatus(`\u274c Upload failed: ${f.name} \u2014 ${e.message}`);}
+    }catch(e){failures++;setStatus(`\u274c ${t('upload_failed')}${f.name} \u2014 ${e.message}`);}
     bar.style.width=`${Math.round((i+1)/total*100)}%`;
   }
   barWrap.classList.remove('active');bar.style.width='0%';
   S.pendingFiles=[];renderTray();
-  if(failures===total&&total>0)throw new Error(`All ${total} upload(s) failed`);
+  if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
   return names;
 }

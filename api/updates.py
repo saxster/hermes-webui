@@ -29,15 +29,39 @@ CACHE_TTL = 1800  # 30 minutes
 
 
 def _run_git(args, cwd, timeout=10):
-    """Run a git command and return (stdout, ok)."""
+    """Run a git command and return (useful output, ok).
+
+    On failure, returns stderr (or stdout as fallback) so callers can
+    surface actionable git error messages instead of empty strings.
+    """
     try:
         r = subprocess.run(
             ['git'] + args, cwd=str(cwd), capture_output=True,
             text=True, timeout=timeout,
         )
-        return r.stdout.strip(), r.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return '', False
+        stdout = r.stdout.strip()
+        stderr = r.stderr.strip()
+        if r.returncode == 0:
+            return stdout, True
+        return stderr or stdout or f"git exited with status {r.returncode}", False
+    except subprocess.TimeoutExpired as exc:
+        detail = (getattr(exc, 'stderr', None) or getattr(exc, 'stdout', None) or '').strip()
+        return detail or f"git {' '.join(args)} timed out after {timeout}s", False
+    except FileNotFoundError:
+        return 'git executable not found', False
+    except OSError as exc:
+        return f'git failed to start: {exc}', False
+
+
+def _split_remote_ref(ref):
+    """Split 'origin/branch-name' into ('origin', 'branch-name').
+
+    Returns (None, ref) if ref contains no slash.
+    """
+    if '/' not in ref:
+        return None, ref
+    remote, branch = ref.split('/', 1)
+    return remote, branch
 
 
 def _detect_default_branch(path):
@@ -64,22 +88,32 @@ def _check_repo(path, name):
     if not fetch_ok:
         return {'name': name, 'behind': 0, 'error': 'fetch failed'}
 
-    branch = _detect_default_branch(path)
+    # Use the current branch's upstream tracking branch, not the repo default.
+    # This avoids false "N updates behind" alerts when the user is on a feature
+    # branch and master/main has moved forward with unrelated commits.
+    # If no upstream is set (brand-new local branch), fall back to the default branch.
+    upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], path)
+    if ok and upstream:
+        # upstream is like "origin/feat/foo" — use it directly in rev-list
+        compare_ref = upstream
+    else:
+        branch = _detect_default_branch(path)
+        compare_ref = f'origin/{branch}'
 
     # Count commits behind
-    out, ok = _run_git(['rev-list', '--count', f'HEAD..origin/{branch}'], path)
+    out, ok = _run_git(['rev-list', '--count', f'HEAD..{compare_ref}'], path)
     behind = int(out) if ok and out.isdigit() else 0
 
     # Get short SHAs for display
     current, _ = _run_git(['rev-parse', '--short', 'HEAD'], path)
-    latest, _ = _run_git(['rev-parse', '--short', f'origin/{branch}'], path)
+    latest, _ = _run_git(['rev-parse', '--short', compare_ref], path)
 
     return {
         'name': name,
         'behind': behind,
         'current_sha': current,
         'latest_sha': latest,
-        'branch': branch,
+        'branch': compare_ref,
     }
 
 
@@ -129,10 +163,37 @@ def _apply_update_inner(target):
     if path is None or not (path / '.git').exists():
         return {'ok': False, 'message': 'Not a git repository'}
 
-    branch = _detect_default_branch(path)
+    # Use the current branch's upstream for pull, matching the behaviour
+    # of _check_repo. Falls back to default branch if no upstream is set.
+    upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], path)
+    if ok and upstream:
+        compare_ref = upstream
+    else:
+        branch = _detect_default_branch(path)
+        compare_ref = f'origin/{branch}'
 
-    # Check for dirty working tree
-    status_out, _ = _run_git(['status', '--porcelain'], path)
+    # Fetch before attempting pull, so the remote ref is current.
+    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet'], path, timeout=15)
+    if not fetch_ok:
+        return {
+            'ok': False,
+            'message': (
+                'Could not reach the remote repository. '
+                'Check your internet connection and try again.'
+            ),
+        }
+
+    # Check for dirty working tree (ignore untracked files — git stash
+    # doesn't include them, so stashing on '??' alone leaves nothing to pop)
+    status_out, status_ok = _run_git(
+        ['status', '--porcelain', '--untracked-files=no'], path
+    )
+    if not status_ok:
+        return {'ok': False, 'message': f'Failed to inspect repo status: {status_out[:200]}'}
+    # Fail early on unresolved merge conflicts
+    if any(line[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
+           for line in status_out.splitlines()):
+        return {'ok': False, 'message': 'Repository has unresolved merge conflicts'}
     stashed = False
     if status_out:
         _, ok = _run_git(['stash'], path)
@@ -140,12 +201,44 @@ def _apply_update_inner(target):
             return {'ok': False, 'message': 'Failed to stash local changes'}
         stashed = True
 
-    # Pull with ff-only (no merge commits)
-    pull_out, pull_ok = _run_git(['pull', '--ff-only', 'origin', branch], path, timeout=30)
+    # Pull with ff-only (no merge commits).
+    # Split tracking refs like 'origin/main' into separate remote + branch
+    # arguments — git treats 'origin/main' as a repository name otherwise.
+    remote, branch = _split_remote_ref(compare_ref)
+    pull_args = ['pull', '--ff-only']
+    if remote:
+        pull_args.extend([remote, branch])
+    else:
+        pull_args.append(compare_ref)
+    pull_out, pull_ok = _run_git(pull_args, path, timeout=30)
     if not pull_ok:
         if stashed:
             _run_git(['stash', 'pop'], path)
-        return {'ok': False, 'message': f'Pull failed: {pull_out[:200]}'}
+
+        # Diagnose the most common failure modes and surface actionable messages.
+        pull_lower = pull_out.lower()
+        if 'not possible to fast-forward' in pull_lower or 'diverged' in pull_lower:
+            return {
+                'ok': False,
+                'message': (
+                    f'The local {target} repo has commits that are not on the remote '
+                    'branch, so a fast-forward update is not possible. '
+                    'Run: git -C ' + str(path) + ' fetch origin && '
+                    'git -C ' + str(path) + ' reset --hard ' + compare_ref
+                ),
+                'diverged': True,
+            }
+        if 'does not track' in pull_lower or 'no tracking information' in pull_lower:
+            return {
+                'ok': False,
+                'message': (
+                    f'The local {target} branch has no upstream tracking branch configured. '
+                    'Run: git -C ' + str(path) + ' branch --set-upstream-to=' + compare_ref
+                ),
+            }
+        # Generic fallback — include the raw git output for debugging.
+        detail = pull_out.strip()[:300] if pull_out.strip() else '(no output from git)'
+        return {'ok': False, 'message': f'Pull failed: {detail}'}
 
     # Pop stash if we stashed
     if stashed:

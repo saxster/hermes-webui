@@ -42,15 +42,15 @@ async function loadCrons() {
           <span class="cron-status ${statusClass}">${statusLabel}</span>
         </div>
         <div class="cron-body" id="cron-body-${job.id}">
-          <div class="cron-schedule">&#128337; ${esc(job.schedule_display || job.schedule?.expression || '')} &nbsp;|&nbsp; Next: ${esc(nextRun)} &nbsp;|&nbsp; Last: ${esc(lastRun)}</div>
+          <div class="cron-schedule">${li('clock',12)} ${esc(job.schedule_display || job.schedule?.expression || '')} &nbsp;|&nbsp; Next: ${esc(nextRun)} &nbsp;|&nbsp; Last: ${esc(lastRun)}</div>
           <div class="cron-prompt">${esc((job.prompt||'').slice(0,300))}${(job.prompt||'').length>300?'…':''}</div>
           <div class="cron-actions">
-            <button class="cron-btn run" onclick="cronRun('${job.id}')">&#9654; Run now</button>
+            <button class="cron-btn run" onclick="cronRun('${job.id}')">${li('play',12)} Run now</button>
             ${statusLabel==='paused'
-              ? `<button class="cron-btn" onclick="cronResume('${job.id}')">&#9654;&#9474; Resume</button>`
-              : `<button class="cron-btn pause" onclick="cronPause('${job.id}')">&#9646;&#9646; Pause</button>`}
-            <button class="cron-btn" onclick="cronEditOpen('${job.id}',${JSON.stringify(job).replace(/"/g,'&quot;')})">&#9998; Edit</button>
-            <button class="cron-btn" style="border-color:rgba(201,168,76,.3);color:var(--accent)" onclick="cronDelete('${job.id}')">&#128465; Delete</button>
+              ? `<button class="cron-btn" onclick="cronResume('${job.id}')">${li('play',12)} Resume</button>`
+              : `<button class="cron-btn pause" onclick="cronPause('${job.id}')">${li('pause',12)} Pause</button>`}
+            <button class="cron-btn" onclick="cronEditOpen('${job.id}',${JSON.stringify(job).replace(/"/g,'&quot;')})">${li('pencil',12)} Edit</button>
+            <button class="cron-btn" style="border-color:rgba(201,168,76,.3);color:var(--accent)" onclick="cronDelete('${job.id}')">${li('trash-2',12)} Delete</button>
           </div>
           <!-- Inline edit form, hidden by default -->
           <div id="cron-edit-${job.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
@@ -172,7 +172,7 @@ async function submitCronCreate(){
     if(_cronSelectedSkills.length)body.skills=_cronSelectedSkills;
     await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
     toggleCronForm();
-    showToast('Job created ✓');
+    showToast('Job created');
     await loadCrons();
   }catch(e){
     errEl.textContent='Error: '+e.message;errEl.style.display='';
@@ -242,7 +242,7 @@ function toggleCron(id) {
 async function cronRun(id) {
   try {
     await api('/api/crons/run', {method:'POST', body: JSON.stringify({job_id: id})});
-    showToast('Job triggered ✓');
+    showToast('Job triggered');
     setTimeout(() => loadCronOutput(id), 5000);
   } catch(e) { showToast('Run failed: ' + e.message, 4000); }
 }
@@ -258,7 +258,7 @@ async function cronPause(id) {
 async function cronResume(id) {
   try {
     await api('/api/crons/resume', {method:'POST', body: JSON.stringify({job_id: id})});
-    showToast('Job resumed ✓');
+    showToast('Job resumed');
     await loadCrons();
   } catch(e) { showToast('Resume failed: ' + e.message, 4000); }
 }
@@ -290,13 +290,14 @@ async function cronEditSave(id) {
     const updates = {job_id: id, schedule, prompt};
     if (name) updates.name = name;
     await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
-    showToast('Job updated ✓');
+    showToast('Job updated');
     await loadCrons();
   } catch(e) { errEl.textContent = 'Error: ' + e.message; errEl.style.display = ''; }
 }
 
 async function cronDelete(id) {
-  if (!confirm('Delete this cron job? This cannot be undone.')) return;
+  const _delCron=await showConfirmDialog({title:'Delete cron job',message:'This cannot be undone.',confirmLabel:'Delete',danger:true,focusCancel:true});
+  if(!_delCron) return;
   try {
     await api('/api/crons/delete', {method:'POST', body: JSON.stringify({job_id: id})});
     showToast('Job deleted');
@@ -307,10 +308,11 @@ async function cronDelete(id) {
 function loadTodos() {
   const panel = $('todoPanel');
   if (!panel) return;
+  const sourceMessages = (S.session && Array.isArray(S.session.messages) && S.session.messages.length) ? S.session.messages : S.messages;
   // Parse the most recent todo state from message history
   let todos = [];
-  for (let i = S.messages.length - 1; i >= 0; i--) {
-    const m = S.messages[i];
+  for (let i = sourceMessages.length - 1; i >= 0; i--) {
+    const m = sourceMessages[i];
     if (m && m.role === 'tool') {
       try {
         const d = JSON.parse(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
@@ -325,11 +327,11 @@ function loadTodos() {
     panel.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:4px 0">No active task list in this session.</div>';
     return;
   }
-  const statusIcon = {pending:'○', in_progress:'◉', completed:'✓', cancelled:'✗'};
+  const statusIcon = {pending:li('square',14), in_progress:li('loader',14), completed:li('check',14), cancelled:li('x',14)};
   const statusColor = {pending:'var(--muted)', in_progress:'var(--blue)', completed:'rgba(100,200,100,.8)', cancelled:'rgba(200,100,100,.5)'};
   panel.innerHTML = todos.map(t => `
     <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:14px;flex-shrink:0;margin-top:1px;color:${statusColor[t.status]||'var(--muted)'}">${statusIcon[t.status]||'○'}</span>
+      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${statusColor[t.status]||'var(--muted)'}">${statusIcon[t.status]||li('square',14)}</span>
       <div style="flex:1;min-width:0">
         <div style="font-size:13px;color:${t.status==='completed'?'var(--muted)':t.status==='in_progress'?'var(--text)':'var(--text)'};${t.status==='completed'?'text-decoration:line-through;opacity:.5':''};line-height:1.4">${esc(t.content)}</div>
         <div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(t.id)} · ${esc(t.status)}</div>
@@ -339,7 +341,8 @@ function loadTodos() {
 
 async function clearConversation() {
   if(!S.session) return;
-  if(!confirm('Clear all messages in this conversation? This cannot be undone.')) return;
+  const _clrMsg=await showConfirmDialog({title:'Clear conversation',message:'Clear all messages? This cannot be undone.',confirmLabel:'Clear',danger:true,focusCancel:true});
+  if(!_clrMsg) return;
   try {
     const data = await api('/api/session/clear', {method:'POST',
       body: JSON.stringify({session_id: S.session.session_id})});
@@ -383,7 +386,7 @@ function renderSkills(skills) {
   for (const [cat, items] of Object.entries(cats).sort()) {
     const sec = document.createElement('div');
     sec.className = 'skills-category';
-    sec.innerHTML = `<div class="skills-cat-header">&#128193; ${esc(cat)} <span style="opacity:.5">(${items.length})</span></div>`;
+    sec.innerHTML = `<div class="skills-cat-header">${li('folder',12)} ${esc(cat)} <span style="opacity:.5">(${items.length})</span></div>`;
     for (const skill of items.sort((a,b) => a.name.localeCompare(b.name))) {
       const el = document.createElement('div');
       el.className = 'skill-item';
@@ -480,7 +483,7 @@ async function submitSkillSave() {
   if (!content.trim()) { errEl.textContent = 'Content is required'; errEl.style.display = ''; return; }
   try {
     await api('/api/skills/save', {method:'POST', body: JSON.stringify({name, category: category||undefined, content})});
-    showToast(_editingSkillName ? 'Skill updated ✓' : 'Skill created ✓');
+    showToast(_editingSkillName ? 'Skill updated' : 'Skill created');
     _skillsData = null;
     toggleSkillForm();
     await loadSkills();
@@ -512,7 +515,7 @@ async function submitMemorySave() {
   errEl.style.display = 'none';
   try {
     await api('/api/memory/write', {method:'POST', body: JSON.stringify({section: 'memory', content})});
-    showToast('Memory saved ✓');
+    showToast('Memory saved');
     closeMemoryEdit();
     await loadMemory(true);
   } catch(e) { errEl.textContent = 'Error: ' + e.message; errEl.style.display = ''; }
@@ -530,48 +533,95 @@ function getWorkspaceFriendlyName(path){
   return path.split('/').filter(Boolean).pop()||path;
 }
 
+function syncWorkspaceDisplays(){
+  const hasSession=!!(S.session&&S.session.workspace);
+  const ws=hasSession?S.session.workspace:'';
+  const label=hasSession?getWorkspaceFriendlyName(ws):t('no_workspace');
+
+  const sidebarName=$('sidebarWsName');
+  const sidebarPath=$('sidebarWsPath');
+  if(sidebarName) sidebarName.textContent=label;
+  if(sidebarPath) sidebarPath.textContent=ws;
+
+  const composerChip=$('composerWorkspaceChip');
+  const composerLabel=$('composerWorkspaceLabel');
+  const composerDropdown=$('composerWsDropdown');
+  if(!hasSession && composerDropdown) composerDropdown.classList.remove('open');
+  if(composerLabel) composerLabel.textContent=label;
+  if(composerChip){
+    composerChip.disabled=!hasSession;
+    composerChip.title=hasSession?ws:'No active workspace';
+    composerChip.classList.toggle('active',!!(composerDropdown&&composerDropdown.classList.contains('open')));
+  }
+}
+
 async function loadWorkspaceList(){
   try{
     const data = await api('/api/workspaces');
     _workspaceList = data.workspaces || [];
-    // Refresh sidebar display if we have a current session
-    if(S.session && S.session.workspace) {
-      const sidebarName=$('sidebarWsName');
-      const sidebarPath=$('sidebarWsPath');
-      if(sidebarName) sidebarName.textContent=getWorkspaceFriendlyName(S.session.workspace);
-      if(sidebarPath) sidebarPath.textContent=S.session.workspace;
-    }
+    syncWorkspaceDisplays();
     return data;
   }catch(e){ return {workspaces:[], last:''}; }
 }
 
-function renderWorkspaceDropdown(workspaces, currentWs){
-  const dd = $('wsDropdown');
+function _renderWorkspaceAction(label, meta, iconSvg, onClick){
+  const opt=document.createElement('div');
+  opt.className='ws-opt ws-opt-action';
+  opt.innerHTML=`<span class="ws-opt-icon">${iconSvg}</span><span><span class="ws-opt-name">${esc(label)}</span>${meta?`<span class="ws-opt-meta">${esc(meta)}</span>`:''}</span>`;
+  opt.onclick=onClick;
+  return opt;
+}
+
+function _positionComposerWsDropdown(){
+  const dd=$('composerWsDropdown');
+  const chip=$('composerWorkspaceChip');
+  const footer=document.querySelector('.composer-footer');
+  if(!dd||!chip||!footer)return;
+  const chipRect=chip.getBoundingClientRect();
+  const footerRect=footer.getBoundingClientRect();
+  let left=chipRect.left-footerRect.left;
+  const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
+  left=Math.max(0, Math.min(left, maxLeft));
+  dd.style.left=`${left}px`;
+}
+
+function _positionProfileDropdown(){
+  const dd=$('profileDropdown');
+  const chip=$('profileChip');
+  const footer=document.querySelector('.composer-footer');
+  if(!dd||!chip||!footer)return;
+  const chipRect=chip.getBoundingClientRect();
+  const footerRect=footer.getBoundingClientRect();
+  let left=chipRect.left-footerRect.left;
+  const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
+  left=Math.max(0, Math.min(left, maxLeft));
+  dd.style.left=`${left}px`;
+}
+
+function renderWorkspaceDropdownInto(dd, workspaces, currentWs){
   if(!dd)return;
   dd.innerHTML='';
   for(const w of workspaces){
     const opt=document.createElement('div');
     opt.className='ws-opt'+(w.path===currentWs?' active':'');
     opt.innerHTML=`<span class="ws-opt-name">${esc(w.name)}</span><span class="ws-opt-path">${esc(w.path)}</span>`;
-    opt.onclick=async()=>{
-      closeWsDropdown();
-      if(!S.session||w.path===S.session.workspace)return;
-      await api('/api/session/update',{method:'POST',body:JSON.stringify({
-        session_id:S.session.session_id, workspace:w.path, model:S.session.model
-      })});
-      S.session.workspace=w.path;
-      syncTopbar();
-      await loadDir('.');
-      showToast(`Switched to ${w.name}`);
-    };
+    opt.onclick=()=>switchToWorkspace(w.path,w.name);
     dd.appendChild(opt);
   }
-  // Divider + Manage link
+  dd.appendChild(document.createElement('div')).className='ws-divider';
+  dd.appendChild(_renderWorkspaceAction(
+    'Choose workspace path',
+    'Add a validated path and switch this conversation',
+    li('folder',12),
+    ()=>promptWorkspacePath()
+  ));
   const div=document.createElement('div');div.className='ws-divider';dd.appendChild(div);
-  const mgmt=document.createElement('div');mgmt.className='ws-opt ws-manage';
-  mgmt.innerHTML='&#9881; Manage workspaces';
-  mgmt.onclick=()=>{closeWsDropdown();switchPanel('workspaces');};
-  dd.appendChild(mgmt);
+  dd.appendChild(_renderWorkspaceAction(
+    'Manage workspaces',
+    'Open the Spaces panel',
+    li('settings',12),
+    ()=>{closeWsDropdown();mobileSwitchPanel('workspaces');}
+  ));
 }
 
 function toggleWsDropdown(){
@@ -582,18 +632,47 @@ function toggleWsDropdown(){
   else{
     closeProfileDropdown(); // close profile dropdown if open
     loadWorkspaceList().then(data=>{
-      renderWorkspaceDropdown(data.workspaces, S.session?S.session.workspace:'');
+      renderWorkspaceDropdownInto(dd, data.workspaces, S.session?S.session.workspace:'');
       dd.classList.add('open');
+    });
+  }
+}
+
+function toggleComposerWsDropdown(){
+  const dd=$('composerWsDropdown');
+  const chip=$('composerWorkspaceChip');
+  if(!dd||!chip||chip.disabled)return;
+  const open=dd.classList.contains('open');
+  if(open){closeWsDropdown();}
+  else{
+    closeProfileDropdown();
+    if(typeof closeModelDropdown==='function') closeModelDropdown();
+    loadWorkspaceList().then(data=>{
+      renderWorkspaceDropdownInto(dd, data.workspaces, S.session?S.session.workspace:'');
+      dd.classList.add('open');
+      _positionComposerWsDropdown();
+      chip.classList.add('active');
     });
   }
 }
 
 function closeWsDropdown(){
   const dd=$('wsDropdown');
+  const composerDd=$('composerWsDropdown');
+  const composerChip=$('composerWorkspaceChip');
   if(dd)dd.classList.remove('open');
+  if(composerDd)composerDd.classList.remove('open');
+  if(composerChip)composerChip.classList.remove('active');
 }
 document.addEventListener('click',e=>{
-  if(!e.target.closest('#sidebarWsDisplay') && !e.target.closest('#wsDropdown'))closeWsDropdown();
+  if(
+    !e.target.closest('#composerWorkspaceChip') &&
+    !e.target.closest('#composerWsDropdown')
+  ) closeWsDropdown();
+});
+window.addEventListener('resize',()=>{
+  const dd=$('composerWsDropdown');
+  if(dd&&dd.classList.contains('open')) _positionComposerWsDropdown();
 });
 
 async function loadWorkspacesPanel(){
@@ -614,15 +693,15 @@ function renderWorkspacesPanel(workspaces){
         <div class="ws-row-path">${esc(w.path)}</div>
       </div>
       <div class="ws-row-actions">
-        <button class="ws-action-btn" title="Use in current session" onclick="switchToWorkspace('${esc(w.path)}','${esc(w.name)}')">&#8594; Use</button>
-        <button class="ws-action-btn danger" title="Remove" onclick="removeWorkspace('${esc(w.path)}')">&#10005;</button>
+        <button class="ws-action-btn" title="Use in current session" onclick="switchToWorkspace('${esc(w.path)}','${esc(w.name)}')">${li('arrow-right',12)} Use</button>
+        <button class="ws-action-btn danger" title="Remove" onclick="removeWorkspace('${esc(w.path)}')">${li('x',12)}</button>
       </div>`;
     panel.appendChild(row);
   }
   const addRow=document.createElement('div');addRow.className='ws-add-row';
   addRow.innerHTML=`
     <input id="wsAddInput" placeholder="Add workspace path (e.g. /home/user/my-project)" style="flex:1;background:rgba(255,255,255,.06);border:1px solid var(--border2);border-radius:7px;color:var(--text);padding:7px 10px;font-size:12px;outline:none;">
-    <button class="ws-action-btn" onclick="addWorkspace()">&#43; Add</button>`;
+    <button class="ws-action-btn" onclick="addWorkspace()">${li('plus',12)} Add</button>`;
   panel.appendChild(addRow);
   const hint=document.createElement('div');
   hint.style.cssText='font-size:11px;color:var(--muted);padding:4px 0 8px';
@@ -644,7 +723,8 @@ async function addWorkspace(){
 }
 
 async function removeWorkspace(path){
-  if(!confirm(`Remove workspace "${path}"?`))return;
+  const _rmWs=await showConfirmDialog({title:'Remove workspace',message:`Remove "${path}"?`,confirmLabel:'Remove',danger:true,focusCancel:true});
+  if(!_rmWs) return;
   try{
     const data=await api('/api/workspaces/remove',{method:'POST',body:JSON.stringify({path})});
     _workspaceList=data.workspaces;
@@ -653,16 +733,58 @@ async function removeWorkspace(path){
   }catch(e){setStatus('Remove failed: '+e.message);}
 }
 
+async function promptWorkspacePath(){
+  if(!S.session)return;
+  const value=await showPromptDialog({
+    title:'Switch workspace',
+    message:'Enter an absolute workspace path to add and switch this conversation to.',
+    confirmLabel:'Switch',
+    placeholder:'/Users/you/project',
+    value:S.session.workspace||''
+  });
+  const path=(value||'').trim();
+  if(!path)return;
+  try{
+    const data=await api('/api/workspaces/add',{method:'POST',body:JSON.stringify({path})});
+    _workspaceList=data.workspaces||[];
+    const target=_workspaceList[_workspaceList.length-1];
+    if(!target) throw new Error('Workspace was not added');
+    await switchToWorkspace(target.path,target.name);
+  }catch(e){
+    if(String(e.message||'').includes('Workspace already in list')){
+      showToast('Workspace already saved — choose it from the list');
+      return;
+    }
+    showToast('Workspace switch failed: '+e.message);
+  }
+}
+
 async function switchToWorkspace(path,name){
   if(!S.session)return;
+  if(S.busy){
+    showToast('Cannot switch workspace while agent is running');
+    return;
+  }
+  if(typeof _previewDirty!=='undefined'&&_previewDirty){
+    const discard=await showConfirmDialog({
+      title:'Discard file edits?',
+      message:'Switching workspaces will discard unsaved file edits in the preview.',
+      confirmLabel:t('discard'),
+      danger:true
+    });
+    if(!discard)return;
+    if(typeof cancelEditMode==='function')cancelEditMode();
+    if(typeof clearPreview==='function')clearPreview();
+  }
   try{
+    closeWsDropdown();
     await api('/api/session/update',{method:'POST',body:JSON.stringify({
       session_id:S.session.session_id, workspace:path, model:S.session.model
     })});
     S.session.workspace=path;
     syncTopbar();
     await loadDir('.');
-    showToast(`Switched to ${name}`);
+    showToast(`Switched to ${name||getWorkspaceFriendlyName(path)}`);
   }catch(e){setStatus('Switch failed: '+e.message);}
 }
 
@@ -701,7 +823,7 @@ async function loadProfilesPanel() {
           </div>
           <div class="profile-card-actions">
             ${!isActive ? `<button class="ws-action-btn" onclick="switchToProfile('${esc(p.name)}')" title="Switch to this profile">Use</button>` : ''}
-            ${!p.is_default ? `<button class="ws-action-btn danger" onclick="deleteProfile('${esc(p.name)}')" title="Delete this profile">&#10005;</button>` : ''}
+            ${!p.is_default ? `<button class="ws-action-btn danger" onclick="deleteProfile('${esc(p.name)}')" title="Delete this profile">${li('x',12)}</button>` : ''}
           </div>
         </div>`;
       panel.appendChild(card);
@@ -737,8 +859,8 @@ function renderProfileDropdown(data) {
   // Divider + Manage link
   const div = document.createElement('div'); div.className = 'ws-divider'; dd.appendChild(div);
   const mgmt = document.createElement('div'); mgmt.className = 'profile-opt ws-manage';
-  mgmt.innerHTML = '&#9881; Manage profiles';
-  mgmt.onclick = () => { closeProfileDropdown(); switchPanel('profiles'); };
+  mgmt.innerHTML = `${li('settings',12)} Manage profiles`;
+  mgmt.onclick = () => { closeProfileDropdown(); mobileSwitchPanel('profiles'); };
   dd.appendChild(mgmt);
 }
 
@@ -747,18 +869,28 @@ function toggleProfileDropdown() {
   if (!dd) return;
   if (dd.classList.contains('open')) { closeProfileDropdown(); return; }
   closeWsDropdown(); // close workspace dropdown if open
+  if(typeof closeModelDropdown==='function') closeModelDropdown();
   api('/api/profiles').then(data => {
     renderProfileDropdown(data);
     dd.classList.add('open');
+    _positionProfileDropdown();
+    const chip=$('profileChip');
+    if(chip) chip.classList.add('active');
   }).catch(e => { showToast('Failed to load profiles'); });
 }
 
 function closeProfileDropdown() {
   const dd = $('profileDropdown');
   if (dd) dd.classList.remove('open');
+  const chip=$('profileChip');
+  if(chip) chip.classList.remove('active');
 }
 document.addEventListener('click', e => {
-  if (!e.target.closest('#profileChipWrap')) closeProfileDropdown();
+  if (!e.target.closest('#profileChipWrap') && !e.target.closest('#profileDropdown')) closeProfileDropdown();
+});
+window.addEventListener('resize',()=>{
+  const dd=$('profileDropdown');
+  if(dd&&dd.classList.contains('open')) _positionProfileDropdown();
 });
 
 async function switchToProfile(name) {
@@ -841,6 +973,8 @@ function toggleProfileForm() {
   if (form.style.display !== 'none') {
     $('profileFormName').value = '';
     $('profileFormClone').checked = false;
+    if ($('profileFormBaseUrl')) $('profileFormBaseUrl').value = '';
+    if ($('profileFormApiKey')) $('profileFormApiKey').value = '';
     const errEl = $('profileFormError');
     if (errEl) errEl.style.display = 'none';
     $('profileFormName').focus();
@@ -854,7 +988,15 @@ async function submitProfileCreate() {
   if (!name) { errEl.textContent = 'Name is required'; errEl.style.display = ''; return; }
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) { errEl.textContent = 'Lowercase letters, numbers, hyphens, underscores only'; errEl.style.display = ''; return; }
   try {
-    await api('/api/profile/create', { method: 'POST', body: JSON.stringify({ name, clone_config: cloneConfig }) });
+    const baseUrl = (($('profileFormBaseUrl') && $('profileFormBaseUrl').value) || '').trim();
+    const apiKey = (($('profileFormApiKey') && $('profileFormApiKey').value) || '').trim();
+    if (baseUrl && !/^https?:\/\//.test(baseUrl)) {
+      errEl.textContent = 'Base URL must start with http:// or https://'; errEl.style.display = ''; return;
+    }
+    const payload = { name, clone_config: cloneConfig };
+    if (baseUrl) payload.base_url = baseUrl;
+    if (apiKey) payload.api_key = apiKey;
+    await api('/api/profile/create', { method: 'POST', body: JSON.stringify(payload) });
     toggleProfileForm();
     await loadProfilesPanel();
     showToast('Profile created: ' + name);
@@ -862,7 +1004,8 @@ async function submitProfileCreate() {
 }
 
 async function deleteProfile(name) {
-  if (!confirm(`Delete profile "${name}"? This removes all config, skills, memory, and sessions for this profile.`)) return;
+  const _delProf=await showConfirmDialog({title:`Delete profile "${name}"?`,message:'This removes all config, skills, memory, and sessions for this profile.',confirmLabel:'Delete',danger:true,focusCancel:true});
+  if(!_delProf) return;
   try {
     await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
     await loadProfilesPanel();
@@ -880,7 +1023,7 @@ async function loadMemory(force) {
     panel.innerHTML = `
       <div class="memory-section">
         <div class="memory-section-title">
-          &#129504; My Notes
+          <span style="display:inline-flex;align-items:center;gap:6px">${li('brain',14)} My Notes</span>
           <span class="memory-mtime">${fmtTime(data.memory_mtime)}</span>
         </div>
         ${data.memory
@@ -889,7 +1032,7 @@ async function loadMemory(force) {
       </div>
       <div class="memory-section">
         <div class="memory-section-title">
-          &#128100; User Profile
+          <span style="display:inline-flex;align-items:center;gap:6px">${li('user',14)} User Profile</span>
           <span class="memory-mtime">${fmtTime(data.user_mtime)}</span>
         </div>
         ${data.user
@@ -910,6 +1053,44 @@ document.addEventListener('drop',e=>{e.preventDefault();dragCounter=0;wrap.class
 
 let _settingsDirty = false;
 let _settingsThemeOnOpen = null; // track theme at open time for discard revert
+let _settingsSection = 'conversation';
+
+function switchSettingsSection(name){
+  const section=(name==='preferences'||name==='system')?name:'conversation';
+  _settingsSection=section;
+  const map={conversation:'Conversation',preferences:'Preferences',system:'System'};
+  ['conversation','preferences','system'].forEach(key=>{
+    const tab=$('settingsTab'+map[key]);
+    const pane=$('settingsPane'+map[key]);
+    const active=key===section;
+    if(tab){
+      tab.classList.toggle('active',active);
+      tab.setAttribute('aria-selected',active?'true':'false');
+    }
+    if(pane) pane.classList.toggle('active',active);
+  });
+}
+
+function _syncHermesPanelSessionActions(){
+  const hasSession=!!S.session;
+  const visibleMessages=hasSession?(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool').length:0;
+  const title=hasSession?(S.session.title||'Untitled'):'No active conversation selected.';
+  const meta=$('hermesSessionMeta');
+  if(meta){
+    meta.textContent=hasSession
+      ? `${title} · ${visibleMessages} message${visibleMessages===1?'':'s'}`
+      : 'No active conversation selected.';
+  }
+  const setDisabled=(id,disabled)=>{
+    const el=$(id);
+    if(!el)return;
+    el.disabled=!!disabled;
+    el.classList.toggle('disabled',!!disabled);
+  };
+  setDisabled('btnDownload',!hasSession||visibleMessages===0);
+  setDisabled('btnExportJSON',!hasSession);
+  setDisabled('btnClearConvModal',!hasSession||visibleMessages===0);
+}
 
 function toggleSettings(){
   const overlay=$('settingsOverlay');
@@ -917,6 +1098,7 @@ function toggleSettings(){
   if(overlay.style.display==='none'){
     _settingsDirty = false;
     _settingsThemeOnOpen = document.documentElement.dataset.theme || 'dark';
+    _settingsSection = 'conversation';
     overlay.style.display='';
     loadSettingsPanel();
   } else {
@@ -924,12 +1106,26 @@ function toggleSettings(){
   }
 }
 
+function _resetSettingsPanelState(){
+  _settingsSection = 'conversation';
+  switchSettingsSection('conversation');
+  const bar=$('settingsUnsavedBar');
+  if(bar) bar.style.display='none';
+}
+
+function _hideSettingsPanel(){
+  const overlay=$('settingsOverlay');
+  if(!overlay) return;
+  _resetSettingsPanelState();
+  overlay.style.display='none';
+}
+
 // Close with unsaved-changes check. If dirty, show a confirm dialog.
 function _closeSettingsPanel(){
   if(!_settingsDirty){
     // Nothing changed -- revert any live preview and close
     _revertSettingsPreview();
-    $('settingsOverlay').style.display='none';
+    _hideSettingsPanel();
     return;
   }
   // Dirty -- show inline confirm bar
@@ -957,14 +1153,14 @@ function _showSettingsUnsavedBar(){
     + '<button onclick="_discardSettings()" style="padding:5px 12px;border-radius:6px;border:1px solid var(--border2);background:rgba(255,255,255,.06);color:var(--muted);cursor:pointer;font-size:12px;font-weight:600">Discard</button>'
     + '<button onclick="saveSettings(true)" style="padding:5px 12px;border-radius:6px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-size:12px;font-weight:600">Save</button>'
     + '</span>';
-  const body = document.querySelector('.settings-body') || document.querySelector('.settings-panel');
+  const body = document.querySelector('.settings-main') || document.querySelector('.settings-body') || document.querySelector('.settings-panel');
   if(body) body.prepend(bar);
 }
 
 function _discardSettings(){
   _revertSettingsPreview();
   _settingsDirty = false;
-  $('settingsOverlay').style.display = 'none';
+  _hideSettingsPanel();
 }
 
 // Mark settings as dirty whenever anything changes
@@ -975,6 +1171,8 @@ function _markSettingsDirty(){
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
+    // Apply server-persisted locale immediately (overrides localStorage boot default)
+    if(settings.language && typeof setLocale==='function') setLocale(settings.language);
     // Populate model dropdown from /api/models
     const modelSel=$('settingsModel');
     if(modelSel){
@@ -1001,6 +1199,20 @@ async function loadSettingsPanel(){
     // Theme preference
     const themeSel=$('settingsTheme');
     if(themeSel){themeSel.value=settings.theme||'dark';themeSel.addEventListener('change',_markSettingsDirty,{once:false});}
+    // Language preference — populate from LOCALES bundle
+    const langSel=$('settingsLanguage');
+    if(langSel){
+      langSel.innerHTML='';
+      if(typeof LOCALES!=='undefined'){
+        for(const [code,bundle] of Object.entries(LOCALES)){
+          const opt=document.createElement('option');
+          opt.value=code;opt.textContent=bundle._label||code;
+          langSel.appendChild(opt);
+        }
+      }
+      langSel.value=settings.language||'en';
+      langSel.addEventListener('change',_markSettingsDirty,{once:false});
+    }
     const showUsageCb=$('settingsShowTokenUsage');
     if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_markSettingsDirty,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
@@ -1009,6 +1221,15 @@ async function loadSettingsPanel(){
     if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_markSettingsDirty,{once:false});}
     const updateCb=$('settingsCheckUpdates');
     if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    const soundCb=$('settingsSoundEnabled');
+    if(soundCb){soundCb.checked=!!settings.sound_enabled;soundCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    const notifCb=$('settingsNotificationsEnabled');
+    if(notifCb){notifCb.checked=!!settings.notifications_enabled;notifCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    const bubbleCb=$('settingsBubbleLayout');
+    if(bubbleCb){bubbleCb.checked=!!settings.bubble_layout;bubbleCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    // Bot name
+    const botNameField=$('settingsBotName');
+    if(botNameField){botNameField.value=settings.bot_name||'Hermes';botNameField.addEventListener('input',_markSettingsDirty,{once:false});}
     // Password field: always blank (we don't send hash back)
     const pwField=$('settingsPassword');
     if(pwField){pwField.value='';pwField.addEventListener('input',_markSettingsDirty,{once:false});}
@@ -1021,8 +1242,10 @@ async function loadSettingsPanel(){
       const disableBtn=$('btnDisableAuth');
       if(disableBtn) disableBtn.style.display=active?'':'none';
     }catch(e){}
+    _syncHermesPanelSessionActions();
+    switchSettingsSection(_settingsSection);
   }catch(e){
-    showToast('Failed to load settings: '+e.message);
+    showToast(t('settings_load_failed')+e.message);
   }
 }
 
@@ -1033,25 +1256,36 @@ async function saveSettings(andClose){
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
   const pw=($('settingsPassword')||{}).value;
   const theme=($('settingsTheme')||{}).value||'dark';
+  const language=($('settingsLanguage')||{}).value||'en';
   const body={};
   if(model) body.default_model=model;
 
   if(sendKey) body.send_key=sendKey;
   body.theme=theme;
+  body.language=language;
   body.show_token_usage=showTokenUsage;
   body.show_cli_sessions=showCliSessions;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
   body.check_for_updates=!!($('settingsCheckUpdates')||{}).checked;
+  body.sound_enabled=!!($('settingsSoundEnabled')||{}).checked;
+  body.notifications_enabled=!!($('settingsNotificationsEnabled')||{}).checked;
+  body.bubble_layout=!!($('settingsBubbleLayout')||{}).checked;
+  document.body.classList.toggle('bubble-layout', body.bubble_layout);
+  const botName=(($('settingsBotName')||{}).value||'').trim();
+  body.bot_name=botName||'Hermes';
   // Password: only act if the field has content; blank = leave auth unchanged
   if(pw && pw.trim()){
     try{
       await api('/api/settings',{method:'POST',body:JSON.stringify({...body,_set_password:pw.trim()})});
       window._sendKey=sendKey||'enter';
       window._showTokenUsage=showTokenUsage;
-      showToast('Settings saved (password set — login now required)');
+      window._soundEnabled=body.sound_enabled;
+      window._notificationsEnabled=body.notifications_enabled;
+      if(typeof setLocale==='function') setLocale(language);
+      if(typeof applyLocaleToDOM==='function') applyLocaleToDOM();
+      showToast(t('settings_saved_pw'));
       _settingsDirty=false; _settingsThemeOnOpen=theme;
-      const bar=$('settingsUnsavedBar'); if(bar) bar.style.display='none';
-      $('settingsOverlay').style.display='none';
+      _hideSettingsPanel();
       return;
     }catch(e){showToast('Save failed: '+e.message);return;}
   }
@@ -1060,14 +1294,23 @@ async function saveSettings(andClose){
     window._sendKey=sendKey||'enter';
     window._showTokenUsage=showTokenUsage;
     window._showCliSessions=showCliSessions;
+    window._soundEnabled=body.sound_enabled;
+    window._notificationsEnabled=body.notifications_enabled;
+    window._botName=body.bot_name;
+    if(typeof applyBotName==='function') applyBotName();
+    if(typeof setLocale==='function') setLocale(language);
+    if(typeof applyLocaleToDOM==='function') applyLocaleToDOM();
+    // Restart gateway SSE when agent session setting changes
+    if(typeof startGatewaySSE==='function'){if(showCliSessions)startGatewaySSE();else if(typeof stopGatewaySSE==='function')stopGatewaySSE();}
     _settingsDirty=false; _settingsThemeOnOpen=theme;
     const bar=$('settingsUnsavedBar'); if(bar) bar.style.display='none';
     renderMessages();
+    if(typeof syncTopbar==='function') syncTopbar();
     if(typeof renderSessionList==='function') renderSessionList();
-    showToast('Settings saved');
-    $('settingsOverlay').style.display='none';
+    showToast(t('settings_saved'));
+    _hideSettingsPanel();
   }catch(e){
-    showToast('Save failed: '+e.message);
+    showToast(t('settings_save_failed')+e.message);
   }
 }
 
@@ -1081,7 +1324,8 @@ async function signOut(){
 }
 
 async function disableAuth(){
-  if(!confirm('Disable password protection? Anyone will be able to access this instance.')) return;
+  const _disAuth=await showConfirmDialog({title:'Disable password protection',message:'Anyone will be able to access this instance.',confirmLabel:'Disable',danger:true,focusCancel:true});
+  if(!_disAuth) return;
   try{
     await api('/api/settings',{method:'POST',body:JSON.stringify({_clear_password:true})});
     showToast('Auth disabled — password protection removed');
@@ -1115,8 +1359,7 @@ function startCronPolling(){
       const data=await api(`/api/crons/recent?since=${_cronPollSince}`);
       if(data.completions&&data.completions.length>0){
         for(const c of data.completions){
-          const icon=c.status==='error'?'\u274c':'\u2705';
-          showToast(`${icon} Cron "${c.name}" ${c.status==='error'?'failed':'completed'}`,4000);
+          showToast(`Cron "${c.name}" ${c.status==='error'?'failed':'completed'}`,4000);
           _cronPollSince=Math.max(_cronPollSince,c.completed_at);
         }
         _cronUnreadCount+=data.completions.length;

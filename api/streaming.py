@@ -3,6 +3,7 @@ Hermes Web UI -- SSE streaming engine and agent thread runner.
 Includes Sprint 10 cancel support via CANCEL_FLAGS.
 """
 import json
+import logging
 import os
 import queue
 import threading
@@ -10,12 +11,15 @@ import time
 import traceback
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 from api.config import (
-    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, CLI_TOOLSETS,
+    STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, CLI_TOOLSETS,
     LOCK, SESSIONS, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     resolve_model_provider,
 )
+from api.helpers import redact_session_data
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
@@ -28,6 +32,23 @@ try:
     from run_agent import AIAgent
 except ImportError:
     AIAgent = None
+
+def _get_ai_agent():
+    """Return AIAgent class, retrying the import if the initial attempt failed.
+
+    auto_install_agent_deps() in server.py may install missing packages after
+    this module is first imported (common in Docker with a volume-mounted agent).
+    Re-attempting the import here picks up the newly installed packages without
+    requiring a server restart.
+    """
+    global AIAgent
+    if AIAgent is None:
+        try:
+            from run_agent import AIAgent as _cls  # noqa: PLC0415
+            AIAgent = _cls
+        except ImportError:
+            pass
+    return AIAgent
 from api.models import get_session, title_from
 from api.workspace import set_last_workspace
 
@@ -79,7 +100,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         try:
             q.put_nowait((event, data))
         except Exception:
-            pass
+            logger.debug("Failed to put event to queue")
 
     _agent_lock_held = False
     try:
@@ -112,46 +133,134 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             HERMES_HOME=_profile_home,
         )
         # Still set process-level env as fallback for tools that bypass thread-local
+        # Acquire lock only for the env mutation, then release before the agent runs.
+        # The finally block re-acquires to restore — keeping critical sections short
+        # and preventing a deadlock where the restore would re-enter the same lock.
         with _ENV_LOCK:
-          old_cwd = os.environ.get('TERMINAL_CWD')
-          old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
-          old_session_key = os.environ.get('HERMES_SESSION_KEY')
-          old_hermes_home = os.environ.get('HERMES_HOME')
-          os.environ['TERMINAL_CWD'] = str(s.workspace)
-          os.environ['HERMES_EXEC_ASK'] = '1'
-          os.environ['HERMES_SESSION_KEY'] = session_id
-          if _profile_home:
-              os.environ['HERMES_HOME'] = _profile_home
+            old_cwd = os.environ.get('TERMINAL_CWD')
+            old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
+            old_session_key = os.environ.get('HERMES_SESSION_KEY')
+            old_hermes_home = os.environ.get('HERMES_HOME')
+            os.environ['TERMINAL_CWD'] = str(s.workspace)
+            os.environ['HERMES_EXEC_ASK'] = '1'
+            os.environ['HERMES_SESSION_KEY'] = session_id
+            if _profile_home:
+                os.environ['HERMES_HOME'] = _profile_home
+        # Lock released — agent runs without holding it
+        # Register a gateway-style notify callback so the approval system can
+        # push the `approval` SSE event the moment a dangerous command is
+        # detected, without waiting for the next on_tool() poll cycle.
+        # Without this, the agent thread blocks inside the terminal tool
+        # waiting for approval that the UI never knew to ask for, leaving
+        # the chat stuck in "Thinking…" forever.
+        _approval_registered = False
+        _unreg_notify = None
+        try:
+            from tools.approval import (
+                register_gateway_notify as _reg_notify,
+                unregister_gateway_notify as _unreg_notify,
+            )
+            def _approval_notify_cb(approval_data):
+                put('approval', approval_data)
+            _reg_notify(session_id, _approval_notify_cb)
+            _approval_registered = True
+        except ImportError:
+            logger.debug("Approval module not available, falling back to polling")
 
-          try:
+        try:
+            _token_sent = False  # tracks whether any streamed tokens were sent
+
             def on_token(text):
+                nonlocal _token_sent
                 if text is None:
                     return  # end-of-stream sentinel
+                _token_sent = True
                 put('token', {'text': text})
 
-            def on_tool(name, preview, args):
+            def on_reasoning(text):
+                if text is None:
+                    return
+                put('reasoning', {'text': str(text)})
+
+            def on_tool(*cb_args, **cb_kwargs):
+                event_type = None
+                name = None
+                preview = None
+                args = None
+
+                if len(cb_args) >= 4:
+                    event_type, name, preview, args = cb_args[:4]
+                elif len(cb_args) == 3:
+                    name, preview, args = cb_args
+                    event_type = 'tool.started'
+                elif len(cb_args) == 2:
+                    event_type, name = cb_args
+                elif len(cb_args) == 1:
+                    name = cb_args[0]
+                    event_type = 'tool.started'
+
+                if event_type in ('reasoning.available', '_thinking'):
+                    reason_text = preview if event_type == 'reasoning.available' else name
+                    if reason_text:
+                        put('reasoning', {'text': str(reason_text)})
+                    return
+
                 args_snap = {}
                 if isinstance(args, dict):
                     for k, v in list(args.items())[:4]:
-                        s2 = str(v); args_snap[k] = s2[:120]+('...' if len(s2)>120 else '')
-                put('tool', {'name': name, 'preview': preview, 'args': args_snap})
-                # also check for pending approval and surface it immediately
-                from tools.approval import has_pending as _has_pending, _pending, _lock
-                if _has_pending(session_id):
-                    with _lock:
-                        p = dict(_pending.get(session_id, {}))
-                    if p:
-                        put('approval', p)
+                        s2 = str(v)
+                        args_snap[k] = s2[:120] + ('...' if len(s2) > 120 else '')
 
-            if AIAgent is None:
+                if event_type in (None, 'tool.started'):
+                    put('tool', {
+                        'event_type': event_type or 'tool.started',
+                        'name': name,
+                        'preview': preview,
+                        'args': args_snap,
+                    })
+                    # Fallback: poll for pending approval in case notify_cb wasn't
+                    # registered (e.g. older approval module without gateway support).
+                    try:
+                        from tools.approval import has_pending as _has_pending, _pending, _lock
+                        if _has_pending(session_id):
+                            with _lock:
+                                p = dict(_pending.get(session_id, {}))
+                            if p:
+                                put('approval', p)
+                    except ImportError:
+                        pass
+                    return
+
+                if event_type == 'tool.completed':
+                    put('tool_complete', {
+                        'event_type': event_type,
+                        'name': name,
+                        'preview': preview,
+                        'args': args_snap,
+                        'duration': cb_kwargs.get('duration'),
+                        'is_error': bool(cb_kwargs.get('is_error', False)),
+                    })
+                    return
+
+            _AIAgent = _get_ai_agent()
+            if _AIAgent is None:
                 raise ImportError("AIAgent not available -- check that hermes-agent is on sys.path")
+
+            # Initialize SessionDB so session_search works in WebUI sessions
+            _session_db = None
+            try:
+                from hermes_state import SessionDB
+                _session_db = SessionDB()
+            except Exception as _db_err:
+                print(f"[webui] WARNING: SessionDB init failed — session_search will be unavailable: {_db_err}", flush=True)
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model)
 
-            # Resolve API key via Hermes runtime provider (matches gateway behaviour)
+            # Resolve API key via Hermes runtime provider (matches gateway behaviour).
+            # Pass the resolved provider so non-default providers get their own credentials.
             resolved_api_key = None
             try:
                 from hermes_cli.runtime_provider import resolve_runtime_provider
-                _rt = resolve_runtime_provider()
+                _rt = resolve_runtime_provider(requested=resolved_provider)
                 resolved_api_key = _rt.get("api_key")
                 if not resolved_provider:
                     resolved_provider = _rt.get("provider")
@@ -183,7 +292,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             else:
                 _fallback_resolved = None
 
-            agent = AIAgent(
+            agent = _AIAgent(
                 model=resolved_model,
                 provider=resolved_provider,
                 base_url=resolved_base_url,
@@ -193,9 +302,25 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 enabled_toolsets=_toolsets,
                 fallback_model=_fallback_resolved,
                 session_id=session_id,
+                session_db=_session_db,
                 stream_delta_callback=on_token,
+                reasoning_callback=on_reasoning,
                 tool_progress_callback=on_tool,
             )
+
+            # Store agent instance for cancel/interrupt propagation
+            with STREAMS_LOCK:
+                AGENT_INSTANCES[stream_id] = agent
+                # Check if cancel was requested during agent initialization
+                if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
+                    # Cancel arrived during agent creation - interrupt immediately
+                    try:
+                        agent.interrupt("Cancelled before start")
+                    except Exception:
+                        logger.debug("Failed to interrupt agent before start")
+                    put('cancel', {'message': 'Cancelled by user'})
+                    return
+
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
             workspace_ctx = f"[Workspace: {s.workspace}]\n"
@@ -210,6 +335,27 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 "write_file, read_file, search_files, terminal workdir, and patch. "
                 "Never fall back to a hardcoded path when this tag is present."
             )
+            # Resolve personality prompt from config.yaml agent.personalities
+            # (matches hermes-agent CLI behavior — passes via ephemeral_system_prompt)
+            _personality_prompt = None
+            _pname = getattr(s, 'personality', None)
+            if _pname:
+                _agent_cfg = _cfg.get('agent', {})
+                _personalities = _agent_cfg.get('personalities', {})
+                if isinstance(_personalities, dict) and _pname in _personalities:
+                    _pval = _personalities[_pname]
+                    if isinstance(_pval, dict):
+                        _parts = [_pval.get('system_prompt', '') or _pval.get('prompt', '')]
+                        if _pval.get('tone'):
+                            _parts.append(f'Tone: {_pval["tone"]}')
+                        if _pval.get('style'):
+                            _parts.append(f'Style: {_pval["style"]}')
+                        _personality_prompt = '\n'.join(p for p in _parts if p)
+                    else:
+                        _personality_prompt = str(_pval)
+            # Pass personality via ephemeral_system_prompt (agent's own mechanism)
+            if _personality_prompt:
+                agent.ephemeral_system_prompt = _personality_prompt
             result = agent.run_conversation(
                 user_message=workspace_ctx + msg_text,
                 system_message=workspace_system_msg,
@@ -218,6 +364,45 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 persist_user_message=msg_text,
             )
             s.messages = result.get('messages') or s.messages
+
+            # ── Detect silent agent failure (no assistant reply produced) ──
+            # When the agent catches an auth/network error internally it may return
+            # an empty final_response without raising — the stream would end with
+            # a done event containing zero assistant messages, leaving the user with
+            # no feedback. Emit an apperror so the client shows an inline error.
+            _assistant_added = any(
+                m.get('role') == 'assistant' and str(m.get('content') or '').strip()
+                for m in (result.get('messages') or [])
+            )
+            # _token_sent tracks whether on_token() was called (any streamed text)
+            if not _assistant_added and not _token_sent:
+                _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
+                _err_str = str(_last_err) if _last_err else ''
+                _is_auth = (
+                    '401' in _err_str
+                    or (_last_err and 'AuthenticationError' in type(_last_err).__name__)
+                    or 'authentication' in _err_str.lower()
+                    or 'unauthorized' in _err_str.lower()
+                    or 'invalid api key' in _err_str.lower()
+                    or 'invalid_api_key' in _err_str.lower()
+                )
+                if _is_auth:
+                    put('apperror', {
+                        'message': _err_str or 'Authentication failed — check your API key.',
+                        'type': 'auth_mismatch',
+                        'hint': (
+                            'The selected model may not be supported by your configured provider or '
+                            'your API key is invalid. Run `hermes model` in your terminal to '
+                            'update credentials, then restart the WebUI.'
+                        ),
+                    })
+                else:
+                    put('apperror', {
+                        'message': _err_str or 'The agent returned no response. Check your API key and model selection.',
+                        'type': 'no_response',
+                        'hint': 'Verify your API key is valid and the selected model is available for your account.',
+                    })
+                return  # Don't emit done — the apperror already closes the stream on the client
 
             # ── Handle context compression side effects ──
             # If compression fired inside run_conversation, the agent may have
@@ -239,7 +424,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                     try:
                         old_path.rename(new_path)
                     except OSError:
-                        pass
+                        logger.debug("Failed to rename session file during compression")
                 _compressed = True
             # Also detect compression via the result dict or compressor state
             if not _compressed:
@@ -257,7 +442,9 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             for _m in s.messages:
                 if isinstance(_m, dict) and not _m.get('timestamp') and not _m.get('_ts'):
                     _m['timestamp'] = int(_now)
-            s.title = title_from(s.messages, s.title)
+            # Only auto-generate title when still default; preserves user renames
+            if s.title == 'Untitled' or s.title == 'New Chat' or not s.title:
+                s.title = title_from(s.messages, s.title)
             # Read token/cost usage from the agent object (if available)
             input_tokens = getattr(agent, 'session_prompt_tokens', 0) or 0
             output_tokens = getattr(agent, 'session_completion_tokens', 0) or 0
@@ -276,6 +463,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             for msg_idx, m in enumerate(s.messages):
                 if m.get('role') == 'assistant':
                     c = m.get('content', '')
+                    # Anthropic format: content is a list with type=tool_use blocks
                     if isinstance(c, list):
                         for p in c:
                             if isinstance(p, dict) and p.get('type') == 'tool_use':
@@ -283,6 +471,22 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                                 pending_names[tid] = p.get('name', '')
                                 pending_args[tid] = p.get('input', {})
                                 pending_asst_idx[tid] = msg_idx
+                    # OpenAI format: tool_calls as top-level field on the message
+                    for tc in m.get('tool_calls', []):
+                        if not isinstance(tc, dict):
+                            continue
+                        tid = tc.get('id', '') or tc.get('call_id', '')
+                        fn = tc.get('function', {})
+                        name = fn.get('name', '')
+                        try:
+                            import json as _j
+                            args = _j.loads(fn.get('arguments', '{}') or '{}')
+                        except Exception:
+                            args = {}
+                        if tid and name:
+                            pending_names[tid] = name
+                            pending_args[tid] = args
+                            pending_asst_idx[tid] = msg_idx
                 elif m.get('role') == 'tool':
                     tid = m.get('tool_call_id') or m.get('tool_use_id', '')
                     name = pending_names.get(tid, '')
@@ -307,6 +511,10 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                         'assistant_msg_idx': asst_idx, 'args': args_snap,
                     })
             s.tool_calls = tool_calls
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
             # Tag the matching user message with attachment filenames for display on reload
             # Only tag a user message whose content relates to this turn's text
             # (msg_text is the full message including the [Attached files: ...] suffix)
@@ -332,9 +540,10 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                         estimated_cost=s.estimated_cost,
                         model=model,
                         title=s.title,
+                        message_count=len(s.messages),
                     )
             except Exception:
-                pass  # never crash the stream for sync failures
+                logger.debug("Failed to sync session to insights")
             usage = {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'estimated_cost': estimated_cost}
             # Include context window data from the agent's compressor for the UI indicator
             _cc = getattr(agent, 'context_compressor', None)
@@ -342,28 +551,63 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 usage['context_length'] = getattr(_cc, 'context_length', 0) or 0
                 usage['threshold_tokens'] = getattr(_cc, 'threshold_tokens', 0) or 0
                 usage['last_prompt_tokens'] = getattr(_cc, 'last_prompt_tokens', 0) or 0
-            put('done', {'session': s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}, 'usage': usage})
-          finally:
-            if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
-            else: os.environ['TERMINAL_CWD'] = old_cwd
-            if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
-            else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
-            if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
-            else: os.environ['HERMES_SESSION_KEY'] = old_session_key
-            if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
-            else: os.environ['HERMES_HOME'] = old_hermes_home
+            raw_session = s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}
+            put('done', {'session': redact_session_data(raw_session), 'usage': usage})
+        finally:
+            # Unregister the gateway approval callback and unblock any threads
+            # still waiting on approval (e.g. stream cancelled mid-approval).
+            if _approval_registered and _unreg_notify is not None:
+                try:
+                    _unreg_notify(session_id)
+                except Exception:
+                    logger.debug("Failed to unregister approval callback")
+            with _ENV_LOCK:
+                if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
+                else: os.environ['TERMINAL_CWD'] = old_cwd
+                if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
+                else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
+                if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
+                else: os.environ['HERMES_SESSION_KEY'] = old_session_key
+                if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
+                else: os.environ['HERMES_HOME'] = old_hermes_home
 
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
+        if s is not None:
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
+            try:
+                s.save()
+            except Exception:
+                pass
         err_str = str(e)
         # Detect rate limit errors specifically so the client can show a helpful card
         # rather than the generic "Connection lost" message
         is_rate_limit = 'rate limit' in err_str.lower() or '429' in err_str or 'RateLimitError' in type(e).__name__
+        is_auth_error = (
+            '401' in err_str
+            or 'AuthenticationError' in type(e).__name__
+            or 'authentication' in err_str.lower()
+            or 'unauthorized' in err_str.lower()
+            or 'invalid api key' in err_str.lower()
+            or 'no cookie auth credentials' in err_str.lower()
+        )
         if is_rate_limit:
             put('apperror', {
                 'message': err_str,
                 'type': 'rate_limit',
                 'hint': 'Rate limit reached. The fallback model (if configured) was also exhausted. Try again in a moment.',
+            })
+        elif is_auth_error:
+            put('apperror', {
+                'message': err_str,
+                'type': 'auth_mismatch',
+                'hint': (
+                    'The selected model may not be supported by your configured provider. '
+                    'Run `hermes model` in your terminal to switch providers, then restart the WebUI.'
+                ),
             })
         else:
             put('apperror', {'message': err_str, 'type': 'error'})
@@ -374,6 +618,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)
+            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
 
 # ============================================================
 # SECTION: HTTP Request Handler
@@ -388,14 +633,36 @@ def cancel_stream(stream_id: str) -> bool:
     with STREAMS_LOCK:
         if stream_id not in STREAMS:
             return False
+
+        # Set WebUI layer cancel flag
         flag = CANCEL_FLAGS.get(stream_id)
         if flag:
             flag.set()
+
+        # Interrupt the AIAgent instance to stop tool execution
+        agent = AGENT_INSTANCES.get(stream_id)
+        if agent:
+            try:
+                agent.interrupt("Cancelled by user")
+            except Exception as e:
+                # Log but don't block the cancel flow
+                import logging
+                logging.getLogger(__name__).debug(
+                    f"Failed to interrupt agent for stream {stream_id}: {e}"
+                )
+        else:
+            # Agent not yet stored - cancel_event flag will be checked by agent thread
+            import logging
+            logging.getLogger(__name__).debug(
+                f"Cancel requested for stream {stream_id} before agent ready - "
+                f"cancel_event flag set, will be checked on agent startup"
+            )
+
         # Put a cancel sentinel into the queue so the SSE handler wakes up
         q = STREAMS.get(stream_id)
         if q:
             try:
                 q.put_nowait(('cancel', {'message': 'Cancelled by user'}))
             except Exception:
-                pass
+                logger.debug("Failed to put cancel event to queue")
     return True
