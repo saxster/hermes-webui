@@ -1,11 +1,36 @@
 # Hermes Web UI
 
+> **ℹ️ Maintenance mode (2026-04-20).** `hermes-webui` is in maintenance mode.
+> A leaner Vite/React dashboard now ships with `hermes-agent` itself and is
+> launched via `hermes web` (default: <http://127.0.0.1:9119>). New feature
+> work lands on the bundled dashboard; this project continues to receive
+> bug fixes and security updates for at least one release cycle. If you
+> rely on the workspace file browser, three-panel layout, or podcast Studio
+> integration that are unique to this project, **keep using it** — this is
+> a heads-up, not a shutdown. See [*Which one should I use?*](#which-one-should-i-use-hermes-web-vs-hermes-webui) below.
+
 [Hermes Agent](https://hermes-agent.nousresearch.com/) is a sophisticated autonomous agent that lives on your server, accessed via a terminal or messaging apps, that remembers what it learns and gets more capable the longer it runs.
 
 Hermes WebUI is a lightweight, dark-themed web app interface in your browser for [Hermes Agent](https://hermes-agent.nousresearch.com/).
 Full parity with the CLI experience - everything you can do from a terminal,
 you can do from this UI. No build step, no framework, no bundler. Just Python
 and vanilla JS.
+
+## Which one should I use: `hermes web` vs `hermes-webui`?
+
+Both are maintained, and they solve slightly different problems:
+
+| Use case | Pick |
+|---|---|
+| Quick dashboard view of agent state, gateway health, cron jobs, capabilities | `hermes web` (bundled with `hermes-agent`) |
+| Full three-panel chat UI with workspace file browser, session projects, podcast Studio | `hermes-webui` (this project) |
+| Connecting one UI to many hermes-agents / profiles remotely | `hermes web` (HTTP subprocess model) |
+| In-process agent (fastest round-trip, same Python interpreter) | `hermes-webui` (in-process model) |
+
+The bundled dashboard is a React app served from `hermes_cli/web_server.py`
+and talks to the agent over HTTP. It started as a dashboard; it may or may
+not grow into a full chat UI. The project here stays the reference
+implementation of a full three-panel chat experience on Python + vanilla JS.
 
 Layout: three-panel. Left sidebar for sessions and navigation, center for chat,
 right for workspace file browsing. Model, profile, and workspace controls live in
