@@ -8,10 +8,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # continues to receive bug fixes and security updates; new feature work
 # lands on the bundled dashboard. Set HERMES_WEBUI_SILENCE_DEPRECATION=1
 # to suppress this banner.
+#
+# Writes to stderr so callers capturing stdout (URL extraction, log
+# piping) stay clean. Only colors the output when stderr is a TTY so
+# systemd/cron/nohup logs don't accumulate raw escape sequences.
 if [[ -z "${HERMES_WEBUI_SILENCE_DEPRECATION:-}" ]]; then
-  printf '\n\033[33m[hermes-webui]\033[0m maintenance mode — see README.md.\n'
-  printf '              For the bundled dashboard: %s\n' 'hermes web'
-  printf '              Silence this: export HERMES_WEBUI_SILENCE_DEPRECATION=1\n\n'
+  if [[ -t 2 ]]; then
+    tag='\033[33m[hermes-webui]\033[0m'
+  else
+    tag='[hermes-webui]'
+  fi
+  printf "\n${tag} maintenance mode — see README.md.\n" >&2
+  printf '              For the bundled dashboard: %s\n' 'hermes web' >&2
+  printf '              Silence this: export HERMES_WEBUI_SILENCE_DEPRECATION=1\n\n' >&2
 fi
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
